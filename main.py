@@ -8,9 +8,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 import asyncio
 
 # === НАСТРОЙКИ ===
-TOKEN = "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ"  # <-- твой токен бота
+TOKEN = "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ"  # твой токен
 GROUP_ID = -1001941069892
-ADMIN_ID = 6878462090  # <-- твой Telegram ID
+ADMIN_ID = 6878462090  # твой Telegram ID
 EMOJIS = ["😂", "💩", "🤡", "🔥", "😎", "🐒", "👽", "💀", "🥴", "🍌", "🤯", "🎉", "🧠", "🍺"]
 
 # === ФАЙЛЫ ===
@@ -51,8 +51,14 @@ async def degrade(msg: Message):
     if user_id not in users:
         users[user_id] = {"iq": 100, "last_time": 0}
 
-    if now - users[user_id]["last_time"] < 3600:
-        await msg.reply("⏳ Деградировать можно раз в час.")
+    elapsed = now - users[user_id]["last_time"]
+    wait_time = 3600  # 1 час в секундах
+
+    if elapsed < wait_time:
+        remain = wait_time - elapsed
+        mins = int(remain // 60)
+        secs = int(remain % 60)
+        await msg.reply(f"⏳ Деградировать можно раз в час.\nПодожди ещё {mins} мин {secs} сек.")
         return
 
     action = random.choice(messages_list)
@@ -94,15 +100,17 @@ async def eair(msg: Message):
         await msg.reply("Пиши в личку.")
         return
 
-    await msg.reply("Админка: /add <текст> <минус_iq>\nУдаление: /del <номер>")
+    await msg.reply("Админка:\n/add <текст> <число> — добавить событие\n/del <номер> — удалить событие")
 
 @dp.message(Command("add"))
 async def add_message(msg: Message):
     if msg.from_user.id != ADMIN_ID:
         return
     try:
-        _, text, delta = msg.text.split(" ", 2)
-        messages_list.append({"text": text, "delta": int(delta)})
+        parts = msg.text.split()
+        delta = int(parts[-1])
+        text = " ".join(parts[1:-1])
+        messages_list.append({"text": text, "delta": delta})
         save_data(MESSAGES_FILE, messages_list)
         await msg.reply("✅ Сообщение добавлено.")
     except:
