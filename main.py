@@ -1,345 +1,178 @@
+import asyncio
 import random
-import sqlite3
-import time
+from datetime import datetime, timedelta
+
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
 )
 
+TOKEN = "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ"
 GROUP_ID = -1001941069892
 ADMIN_ID = 6878462090
-DEGRADE_COOLDOWN = 3600  # 1 час
 
-SMILEYS = ['🎉', '👽', '🤢', '💥', '😵', '🔥', '🍄', '🐒', '🍌', '🤡', '🤠', '🦠', '🧟', '🧠', '🤖']
+INITIAL_IQ = 100
 
-DB = 'degrade_bot.db'
+users = {}  # user_id: {"iq": int, "last_degrade": datetime, "diseases": [], "degrade_multiplier": float}
+degrade_messages = []  # {"text": str, "iq_drop": int, "photo": str or None}
+diseases_list = []  # {"name": str, "multiplier": float}
 
-def get_random_smiley():
-    return random.choice(SMILEYS)
+EMOJIS = ["🎉", "👽", "🤢", "😵", "🧠", "💥", "🔥", "❌"]
 
-# ====== Работа с БД ======
+def random_emoji():
+    return random.choice(EMOJIS)
 
-def init_db():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        iq INTEGER DEFAULT 100,
-        last_degrade INTEGER DEFAULT 0
-    )''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS degrade_cmds (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        text TEXT NOT NULL,
-        iq_loss INTEGER NOT NULL,
-        photo_url TEXT
-    )''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS diseases (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        description TEXT NOT NULL,
-        iq_multiplier REAL NOT NULL
-    )''')
-    cur.execute('''CREATE TABLE IF NOT EXISTS user_diseases (
-        user_id INTEGER,
-        disease_id INTEGER,
-        PRIMARY KEY(user_id, disease_id)
-    )''')
-    conn.commit()
-    conn.close()
-
-def get_user(user_id):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('SELECT iq, last_degrade FROM users WHERE user_id=?', (user_id,))
-    row = cur.fetchone()
-    if row is None:
-        cur.execute('INSERT INTO users (user_id, iq) VALUES (?, ?)', (user_id, 100))
-        conn.commit()
-        iq, last_degrade = 100, 0
-    else:
-        iq, last_degrade = row
-    conn.close()
-    return iq, last_degrade
-
-def update_user_iq(user_id, new_iq):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('UPDATE users SET iq=? WHERE user_id=?', (new_iq, user_id))
-    conn.commit()
-    conn.close()
-
-def update_user_last_degrade(user_id, timestamp):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('UPDATE users SET last_degrade=? WHERE user_id=?', (timestamp, user_id))
-    conn.commit()
-    conn.close()
-
-def add_degrade_cmd(text, iq_loss, photo_url=None):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('INSERT INTO degrade_cmds (text, iq_loss, photo_url) VALUES (?, ?, ?)', (text, iq_loss, photo_url))
-    conn.commit()
-    conn.close()
-
-def del_degrade_cmd(cmd_id):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('DELETE FROM degrade_cmds WHERE id=?', (cmd_id,))
-    conn.commit()
-    conn.close()
-
-def get_all_degrade_cmds():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('SELECT id, text, iq_loss, photo_url FROM degrade_cmds')
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def add_disease(name, description, iq_multiplier):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('INSERT INTO diseases (name, description, iq_multiplier) VALUES (?, ?, ?)', (name, description, iq_multiplier))
-    conn.commit()
-    conn.close()
-
-def del_disease(disease_id):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('DELETE FROM diseases WHERE id=?', (disease_id,))
-    conn.commit()
-    conn.close()
-
-def get_all_diseases():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('SELECT id, name, description, iq_multiplier FROM diseases')
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def get_user_diseases(user_id):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('''
-        SELECT d.id, d.name, d.description, d.iq_multiplier
-        FROM diseases d
-        JOIN user_diseases ud ON d.id = ud.disease_id
-        WHERE ud.user_id=?
-    ''', (user_id,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def add_disease_to_user(user_id, disease_id):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    try:
-        cur.execute('INSERT INTO user_diseases (user_id, disease_id) VALUES (?, ?)', (user_id, disease_id))
-    except sqlite3.IntegrityError:
-        pass
-    conn.commit()
-    conn.close()
-
-def reset_all_users():
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('UPDATE users SET iq=100, last_degrade=0')
-    cur.execute('DELETE FROM user_diseases')
-    conn.commit()
-    conn.close()
-
-def get_top_users(limit=10):
-    conn = sqlite3.connect(DB)
-    cur = conn.cursor()
-    cur.execute('SELECT user_id, iq FROM users ORDER BY iq ASC LIMIT ?', (limit,))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def get_iq_multiplier(user_id):
-    diseases = get_user_diseases(user_id)
-    total_mult = 0.0
-    for _, _, _, mult in diseases:
-        total_mult += mult
-    return total_mult
-
-# ====== Хэндлеры ======
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот для деградации IQ. Используй /degrade в группе.")
+def is_admin(user_id):
+    return user_id == ADMIN_ID
 
 async def degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != GROUP_ID:
         return
 
     user_id = update.effective_user.id
-    iq, last_degrade = get_user(user_id)
-    now = int(time.time())
+    now = datetime.utcnow()
 
-    diff = now - last_degrade
-    if diff < DEGRADE_COOLDOWN:
-        left = DEGRADE_COOLDOWN - diff
+    user = users.get(user_id)
+    if not user:
+        users[user_id] = {"iq": INITIAL_IQ, "last_degrade": None, "diseases": [], "degrade_multiplier": 1.0}
+        user = users[user_id]
+
+    if user["last_degrade"] and now - user["last_degrade"] < timedelta(hours=1):
+        left = timedelta(hours=1) - (now - user["last_degrade"])
+        mins, secs = divmod(left.seconds, 60)
         await update.message.reply_text(
-            f"Деградировать можно раз в час.\nОсталось ждать {left//60} мин {left%60} сек {get_random_smiley()}"
+            f"⏳ Подожди еще {mins} мин {secs} сек до следующей деградации."
         )
         return
 
-    cmds = get_all_degrade_cmds()
-    if not cmds:
-        await update.message.reply_text("Админ пока не добавил команды деградации.")
+    if not degrade_messages:
+        await update.message.reply_text("⚠️ Нет доступных действий для деградации. Админ не добавил их.")
         return
 
-    cmd = random.choice(cmds)
-    cmd_id, text, base_iq_loss, photo_url = cmd
+    action = random.choice(degrade_messages)
+    base_drop = action["iq_drop"]
 
-    multiplier = get_iq_multiplier(user_id)
-    total_iq_loss = max(1, int(base_iq_loss * (1 + multiplier)))
+    multiplier = 0.0
+    for dis in user["diseases"]:
+        multiplier += dis["multiplier"]
+    multiplier = 1.0 + multiplier
 
-    new_iq = iq - total_iq_loss
-    if new_iq < 0:
-        new_iq = 0
+    drop = int(base_drop * multiplier)
 
-    update_user_iq(user_id, new_iq)
-    update_user_last_degrade(user_id, now)
+    user["iq"] -= drop
+    user["last_degrade"] = now
 
-    diseases = get_all_diseases()
-    got_disease_msg = ''
-    if diseases and random.random() < 0.15:
-        disease = random.choice(diseases)
-        disease_id, d_name, d_desc, d_mult = disease
-        user_diseases = [d[0] for d in get_user_diseases(user_id)]
-        if disease_id not in user_diseases:
-            add_disease_to_user(user_id, disease_id)
-            got_disease_msg = (
-                f"\n\n{get_random_smiley()} Вы подхватили болезнь: *{d_name}*!\n"
-                f"Эффект: {d_desc}\n"
-                f"Теперь ваш IQ будет падать на {int(d_mult*100)}% больше, чем ранее."
-            )
+    text = f"{action['text']}, твой IQ упал на {drop} {random_emoji()}\nСейчас IQ: {user['iq']} {random_emoji()}"
 
-    message = (
-        f"{text}\n{get_random_smiley()} Твой IQ упал на {total_iq_loss}.\n"
-        f"Сейчас IQ: {new_iq} {get_random_smiley()}"
-        f"{got_disease_msg}"
-    )
+    # Болезни с вероятностью 10%
+    if diseases_list and random.random() < 0.10:
+        new_disease = random.choice(diseases_list)
+        if new_disease not in user["diseases"]:
+            user["diseases"].append(new_disease)
+            text += f"\n\n🤢 Вы подхватили болезнь: {new_disease['name']}. Теперь ваш IQ падает на {int(new_disease['multiplier']*100)}% больше."
 
-    if photo_url:
-        await update.message.reply_photo(photo=photo_url, caption=message, parse_mode='Markdown')
+    if action.get("photo"):
+        await update.message.reply_photo(action["photo"], caption=text)
     else:
-        await update.message.reply_text(message, parse_mode='Markdown')
+        await update.message.reply_text(text)
 
-async def eair(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != GROUP_ID:
         return
-    cmds = get_all_degrade_cmds()
-    if not cmds:
-        await update.message.reply_text("Нет команд деградации.")
+
+    if not users:
+        await update.message.reply_text("Пока нет данных по IQ.")
         return
-    text = "\n".join(f"{cmd[0]}. {cmd[1]} (IQ {cmd[2]})" for cmd in cmds)
+
+    top_list = sorted(users.items(), key=lambda x: x[1]["iq"], reverse=True)[:10]
+
+    text = "🏆 Топ по IQ:\n"
+    for i, (uid, data) in enumerate(top_list, 1):
+        text += f"{i}. Пользователь {uid}: IQ {data['iq']} {random_emoji()}\n"
+
     await update.message.reply_text(text)
-
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("❌ Формат: /add <текст> <минус_iq> [url_фото]")
-        return
-    try:
-        iq_loss = int(args[-2]) if len(args) > 2 else int(args[-1])
-    except:
-        await update.message.reply_text("❌ Ошибка: IQ должен быть числом.")
-        return
-    if len(args) > 2:
-        text = " ".join(args[:-2])
-        photo_url = args[-1]
-    else:
-        text = " ".join(args[:-1])
-        photo_url = None
-    add_degrade_cmd(text, iq_loss, photo_url)
-    await update.message.reply_text(f"Команда добавлена: \"{text}\" с IQ {iq_loss} и фото: {photo_url or 'нет'}")
-
-async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) != 1 or not context.args[0].isdigit():
-        await update.message.reply_text("❌ Формат: /del <номер>")
-        return
-    cmd_id = int(context.args[0])
-    del_degrade_cmd(cmd_id)
-    await update.message.reply_text(f"Команда #{cmd_id} удалена.")
-
-async def adddis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text("❌ Формат: /adddis <название> <описание> <множитель (например 0.3)>")
-        return
-    name = args[0]
-    iq_multiplier = None
-    try:
-        iq_multiplier = float(args[-1])
-    except:
-        await update.message.reply_text("❌ Ошибка: множитель должен быть числом с плавающей точкой, например 0.3")
-        return
-    description = " ".join(args[1:-1])
-    add_disease(name, description, iq_multiplier)
-    await update.message.reply_text(f"Болезнь \"{name}\" добавлена с множителем IQ {iq_multiplier}")
-
-async def deldis(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) != 1 or not context.args[0].isdigit():
-        await update.message.reply_text("❌ Формат: /deldis <номер>")
-        return
-    disease_id = int(context.args[0])
-    del_disease(disease_id)
-    await update.message.reply_text(f"Болезнь #{disease_id} удалена.")
 
 async def my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    iq, _ = get_user(user_id)
-    diseases = get_user_diseases(user_id)
-    if diseases:
-        dis_text = "\n".join(f"- {d[1]}: {d[2]}" for d in diseases)
-    else:
-        dis_text = "У вас нет болезней."
-    await update.message.reply_text(f"Ваш IQ: {iq}\nБолезни:\n{dis_text}")
+    user = users.get(user_id)
 
-async def resetall(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not user:
+        await update.message.reply_text("Ты еще не деградировал, IQ 100.")
         return
-    reset_all_users()
-    await update.message.reply_text("Сброс IQ и болезней у всех пользователей выполнен.")
 
-async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    users = get_top_users(10)
-    if not users:
-        await update.message.reply_text("Нет данных для топа.")
+    if not user["diseases"]:
+        await update.message.reply_text(f"У тебя нет болезней.\nIQ: {user['iq']}")
         return
-    lines = []
-    for i, (user_id, iq) in enumerate(users, start=1):
-        lines.append(f"{i}. [ID:{user_id}] IQ: {iq}")
-    await update.message.reply_text("Топ по деградации:\n" + "\n".join(lines))
 
-def main():
-    init_db()
-    app = ApplicationBuilder().token("YOUR_TOKEN_HERE").build()
+    dis_text = "\n".join([f"• {d['name']}" for d in user["diseases"]])
+    await update.message.reply_text(f"Твои болезни:\n{dis_text}\nIQ: {user['iq']}")
 
-    app.add_handler(CommandHandler("start", start))
+async def add_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Формат: /add <текст> <iq_падение>")
+        return
+    try:
+        iq_drop = int(context.args[-1])
+    except:
+        await update.message.reply_text("❌ Последний аргумент должен быть числом.")
+        return
+    text = " ".join(context.args[:-1])
+    degrade_messages.append({"text": text, "iq_drop": abs(iq_drop), "photo": None})
+    await update.message.reply_text(f"✅ Добавлено: '{text}' с падением IQ {abs(iq_drop)}")
+
+async def add_disease(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Формат: /adddisease <название> <множитель (например 0.3)>")
+        return
+    try:
+        multiplier = float(context.args[-1])
+    except:
+        await update.message.reply_text("❌ Последний аргумент должен быть числом с плавающей точкой (например 0.3).")
+        return
+    name = " ".join(context.args[:-1])
+    diseases_list.append({"name": name, "multiplier": multiplier})
+    await update.message.reply_text(f"✅ Добавлена болезнь '{name}' с множителем {multiplier}")
+
+async def reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type != "private" or not is_admin(update.effective_user.id):
+        return
+    for u in users.values():
+        u["iq"] = INITIAL_IQ
+        u["last_degrade"] = None
+        u["diseases"] = []
+        u["degrade_multiplier"] = 1.0
+    await update.message.reply_text("✅ Все IQ и болезни сброшены!")
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/degrade - деградация IQ (в группе)\n"
+        "/top - топ IQ (в группе)\n"
+        "/my - мои болезни\n"
+        "/add <текст> <число> - добавить сообщение (админка, в лс)\n"
+        "/adddisease <название> <множитель> - добавить болезнь (админка, в лс)\n"
+        "/reset - сбросить всем IQ и болезни (админка, в лс)\n"
+        "/help - показать это сообщение\n"
+    )
+
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", help_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("degrade", degrade))
-    app.add_handler(CommandHandler("eair", eair))
-    app.add_handler(CommandHandler("add", add))
-    app.add_handler(CommandHandler("del", delete))
-    app.add_handler(CommandHandler("adddis", adddis))
-    app.add_handler(CommandHandler("deldis", deldis))
-    app.add_handler(CommandHandler("my", my))
-    app.add_handler(CommandHandler("resetall", resetall))
     app.add_handler(CommandHandler("top", top))
+    app.add_handler(CommandHandler("my", my))
+    app.add_handler(CommandHandler("add", add_degrade))
+    app.add_handler(CommandHandler("adddisease", add_disease))
+    app.add_handler(CommandHandler("reset", reset_all))
 
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
