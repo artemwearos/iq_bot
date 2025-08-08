@@ -29,9 +29,7 @@ from telegram.ext import (
 
 # ---------------- CONFIG ----------------
 # Рекомендуется: задать BOT_TOKEN в переменной окружения BOT_TOKEN на Railway/Heroku
-BOT_TOKEN = os.environ.get("
-          7909644376:AAEJO4qo53-joyp3N6UCvZG9xPp1gj2m13g
-        ", "REPLACE_WITH_YOUR_TOKEN")
+BOT_TOKEN = os.environ.get("7909644376:AAEJO4qo53-joyp3N6UCvZG9xPp1gj2m13g", "REPLACE_WITH_YOUR_TOKEN")
 # Админы: список id через запятую или в коде по умолчанию
 ADMIN_IDS = set(int(x) for x in os.environ.get("ADMIN_IDS", "6878462090").split(",") if x.strip())
 # ID группы, где работают /degrade и /top (можно менять)
