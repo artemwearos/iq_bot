@@ -19,14 +19,14 @@ from telegram.ext import (
 )
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ"  # <- вставь свой токен
+BOT_TOKEN = "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ"  # <- Поставь свой токен или используй os.environ
 ALLOWED_GROUP_ID = -1001941069892  # <- группа, где работают /degrade и /top
-ADMIN_IDS = {6878462090}  # <- твой(и) id(шники)
+ADMIN_IDS = {6878462090}  # <- множество админов (твой id)
 
 DATA_FILE = Path("data.json")
-AUTOSAVE_INTERVAL = 10  # сек
+AUTOSAVE_INTERVAL = 10  # секунды автосохранения
 DEGRADE_COOLDOWN_SEC = 3600  # 1 час
-DEFAULT_DISEASE_CHANCE = 20  # % шанс заболеть
+DEFAULT_DISEASE_CHANCE = 20  # %
 
 EMOJIS = ["🎉", "👽", "🤢", "😵", "💀", "🤡", "🧠", "🔥", "❌", "⚡️"]
 
@@ -36,7 +36,8 @@ log = logging.getLogger(__name__)
 # -------------- GLOBALS & LOCK --------------
 lock = asyncio.Lock()
 DATA: Dict[str, Any] = {}
-_app = None  # будет Application instance
+_app = None  # будет Application
+
 
 # -------------- UTILITIES --------------
 def utc_now() -> datetime:
@@ -57,10 +58,10 @@ def random_emoji() -> str:
 
 # -------------- PERSISTENCE --------------
 DEFAULT_DATA = {
-    "users": {},  # "user_id": {iq, ultra, points, last_degrade_iso, diseases: [{name,start_iso,duration_h,multiplier}]}
-    "degrade_actions": [],  # [{text, iq_delta}]
-    "diseases": [],  # [{name, multiplier, min_hours, max_hours}]
-    "user_commands": [],  # [{user_id, text}]
+    "users": {},  # "user_id": {"iq":100,"ultra":0,"points":0,"last_degrade_iso":"","diseases":[]}
+    "degrade_actions": [],  # [{"text":...,"iq_delta":-3}, ...]
+    "diseases": [],  # [{"name":...,"multiplier":1.3,"min_hours":24,"max_hours":72}, ...]
+    "user_commands": [],  # [{"user_id":id,"text":...}, ...]
     "disease_chance": DEFAULT_DISEASE_CHANCE,
 }
 
@@ -72,7 +73,7 @@ def load_data():
             with DATA_FILE.open("r", encoding="utf-8") as f:
                 DATA = json.load(f)
         except Exception:
-            log.exception("Failed to load data.json, using defaults.")
+            log.exception("Failed to load data.json, use default")
             DATA = DEFAULT_DATA.copy()
     else:
         DATA = DEFAULT_DATA.copy()
@@ -108,7 +109,7 @@ def ensure_user_record(user_id: int) -> Dict[str, Any]:
             "ultra": 0,
             "points": 0,
             "last_degrade_iso": "",
-            "diseases": [],  # list of {name, start_iso, duration_h, multiplier}
+            "diseases": [],  # [{"name":..., "start_iso":..., "duration_h":..., "multiplier":...}]
         }
     return users[key]
 
@@ -173,7 +174,7 @@ def format_user_diseases(rec: Dict[str, Any]) -> str:
     return "\n".join(out)
 
 
-# -------------- ADMIN MENU states --------------
+# -------------- Conversation states --------------
 (
     S_MENU,
     S_ADD_ACTION_TEXT,
@@ -187,11 +188,12 @@ def format_user_diseases(rec: Dict[str, Any]) -> str:
     S_SET_IQ,
     S_SET_ULTRA,
     S_SET_POINTS,
-    S_SET_DISEASE_CHANCE,
+    S_SET_CHANCE,
     S_CONFIRM_RESET_TIMERS,
 ) = range(14)
 
 
+# -------------- Admin keyboard --------------
 def admin_keyboard():
     kb = [
         [InlineKeyboardButton("➕ Добавить действие", callback_data="add_action")],
@@ -201,7 +203,7 @@ def admin_keyboard():
         [InlineKeyboardButton("🗑 Удалить болезнь", callback_data="del_disease"),
          InlineKeyboardButton("📋 Список болезней", callback_data="list_diseases")],
         [InlineKeyboardButton("👥 Пользовательские команды", callback_data="list_usercmds")],
-        [InlineKeyboardButton("🧾 Управление пользователем (IQ/ultra/points)", callback_data="manage_users")],
+        [InlineKeyboardButton("🧾 Управление (IQ/ultra/points)", callback_data="manage_users")],
         [InlineKeyboardButton("⏱ Сброс таймеров (всем)", callback_data="reset_timers"),
          InlineKeyboardButton("🧴 Сброс болезней (всем)", callback_data="reset_diseases")],
         [InlineKeyboardButton("♻ Сброс IQ всем", callback_data="reset_iq"),
@@ -211,22 +213,22 @@ def admin_keyboard():
     return InlineKeyboardMarkup(kb)
 
 
-# -------------- ADMIN: entry and callback handler --------------
+# -------------- Admin entry --------------
 async def cmd_eair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
         await update.message.reply_text("🚫 Доступ только для админов.")
         return ConversationHandler.END
-    text = (
+    txt = (
         "🛠 *Админ-панель*\n\n"
-        "Через кнопки можно добавлять/удалять действия и болезни, выдавать ultra/points/IQ, "
-        "сбрасывать таймеры и т.д.\n\nНажмите кнопку."
+        "Кнопки ниже управляют ботом. Нажмите нужную кнопку."
     )
-    await update.message.reply_text(text, reply_markup=admin_keyboard(), parse_mode="Markdown")
+    await update.message.reply_text(txt, reply_markup=admin_keyboard(), parse_mode="Markdown")
     return S_MENU
 
 
-async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# -------------- Admin menu callbacks --------------
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
@@ -236,12 +238,11 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     data = query.data
 
-    # Add action
+    # Add action flow
     if data == "add_action":
         await query.message.reply_text("Введите текст действия (пример: Купил айфон в кредит):")
         return S_ADD_ACTION_TEXT
 
-    # Delete action: show list and wait number
     if data == "del_action":
         arr = DATA.get("degrade_actions", [])
         if not arr:
@@ -291,7 +292,6 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text(text)
         return S_MENU
 
-    # user commands
     if data == "list_usercmds":
         arr = DATA.get("user_commands", [])
         if not arr:
@@ -299,11 +299,10 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             return S_MENU
         text = "Пользовательские команды:\n"
         for i, c in enumerate(arr, 1):
-            text += f"{i}. ({c['user_id']}) {c['text']}\n"
+            text += f"{i}. (от {c['user_id']}) {c['text']}\n"
         await query.message.reply_text(text)
         return S_MENU
 
-    # manage users submenu
     if data == "manage_users":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Установить IQ", callback_data="set_iq")],
@@ -326,7 +325,6 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("Введи: <user_id> <points>")
         return S_SET_POINTS
 
-    # reset timers confirm
     if data == "reset_timers":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Подтвердить", callback_data="confirm_reset_timers")],
@@ -361,7 +359,7 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if data == "set_chance":
         await query.message.reply_text(f"Текущий шанс заболевания: {DATA.get('disease_chance', DEFAULT_DISEASE_CHANCE)}%.\nВведите новое значение 0-100:")
-        return S_SET_DISEASE_CHANCE
+        return S_SET_CHANCE
 
     if data == "close":
         await query.message.edit_text("Закрыто.")
@@ -375,7 +373,7 @@ async def admin_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     return S_MENU
 
 
-# -------------- ADMIN: conversation receivers --------------
+# -------------- ADMIN: receivers (Conversation) --------------
 async def receive_add_action_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text:
@@ -563,16 +561,16 @@ async def receive_set_points(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-async def receive_set_disease_chance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_set_chance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = update.message.text.strip()
     try:
         v = int(s)
     except ValueError:
         await update.message.reply_text("Введите целое 0-100.")
-        return S_SET_DISEASE_CHANCE
+        return S_SET_CHANCE
     if not (0 <= v <= 100):
         await update.message.reply_text("Значение должно быть 0-100.")
-        return S_SET_DISEASE_CHANCE
+        return S_SET_CHANCE
     async with lock:
         DATA["disease_chance"] = v
         save_data()
@@ -580,7 +578,7 @@ async def receive_set_disease_chance(update: Update, context: ContextTypes.DEFAU
     return ConversationHandler.END
 
 
-# -------------- USER HANDLERS --------------
+# -------------- USER COMMANDS --------------
 async def cmd_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat is None or chat.id != ALLOWED_GROUP_ID:
@@ -682,7 +680,7 @@ async def cmd_d_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Команда добавлена. Осталось ultra: {rec['ultra']}")
 
 
-# -------------- misc: list --------------
+# -------------- misc --------------
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with lock:
         actions = DATA.get("degrade_actions", [])
@@ -695,13 +693,13 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(txt)
 
 
-# -------------- conversation fallback --------------
+# -------------- fallback --------------
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отмена.")
     return ConversationHandler.END
 
 
-# -------------- build app & handlers --------------
+# -------------- app builder --------------
 def build_app():
     global _app
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -710,7 +708,7 @@ def build_app():
     conv = ConversationHandler(
         entry_points=[CommandHandler("eair", cmd_eair)],
         states={
-            S_MENU: [CallbackQueryHandler(admin_menu_callback)],
+            S_MENU: [CallbackQueryHandler(admin_callback)],
             S_ADD_ACTION_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_add_action_text)],
             S_ADD_ACTION_IQ: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_add_action_iq)],
             S_DEL_ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_del_action)],
@@ -722,8 +720,8 @@ def build_app():
             S_SET_IQ: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_set_iq)],
             S_SET_ULTRA: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_set_ultra)],
             S_SET_POINTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_set_points)],
-            S_SET_DISEASE_CHANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_set_disease_chance)],
-            S_CONFIRM_RESET_TIMERS: [CallbackQueryHandler(admin_menu_callback)],
+            S_SET_CHANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_set_chance)],
+            S_CONFIRM_RESET_TIMERS: [CallbackQueryHandler(admin_callback)],
         },
         fallbacks=[CommandHandler("cancel", admin_cancel)],
         allow_reentry=True,
@@ -738,6 +736,8 @@ def build_app():
     app.add_handler(CommandHandler("my", cmd_my))
     app.add_handler(CommandHandler("d", cmd_d_add))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("help", lambda u, c: c.bot.send_message(chat_id=u.effective_chat.id, text=(
+        "/degrade /top /my /d\nАдмин: /eair"))))
 
     return app
 
@@ -746,7 +746,6 @@ def build_app():
 def main():
     load_data()
     app = build_app()
-    # autosave background
     loop = asyncio.get_event_loop()
     loop.create_task(autosave_loop())
     log.info("Bot starting...")
