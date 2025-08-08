@@ -1,190 +1,224 @@
 import random
-from datetime import datetime, timedelta
+import time
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 
 TOKEN = "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ"
 GROUP_ID = -1001941069892
 ADMIN_ID = 6878462090
-INITIAL_IQ = 100
 
-EMOJIS = ["🎉", "👽", "🤢", "😵", "🧠", "💥", "🔥", "❌"]
+# Смайлы для сообщений
+EMOJIS = ["🎉", "👽", "🤢", "😵", "🔥", "💀", "🤡", "🎈", "⚡️", "🧠"]
 
-def random_emoji():
-    return random.choice(EMOJIS)
+# Данные пользователей: {user_id: {"iq": int, "last_degrade": timestamp, "diseases": set()}}
+users = {}
 
-users = {}  # user_id: {"iq": int, "last_degrade": datetime, "diseases": [disease_names]}
-actions = []  # {"text": str, "iq_drop": int}
-diseases = []  # {"name": str, "multiplier": float}
+# Действия деградации: [{"text": str, "iq_change": int}]
+degrade_actions = []
 
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+# Болезни: {name: multiplier}
+diseases = {}
+
+# Таймаут деградации (в секундах)
+DEGRADE_COOLDOWN = 3600  # 1 час
+
+def save_state():
+    # Пока заглушка (можно подключить файл или БД)
+    pass
+
+def load_state():
+    # Пока заглушка
+    pass
+
+def get_iq(user_id):
+    if user_id not in users:
+        users[user_id] = {"iq": 100, "last_degrade": 0, "diseases": set()}
+    return users[user_id]["iq"]
+
+def set_iq(user_id, iq):
+    if user_id not in users:
+        users[user_id] = {"iq": 100, "last_degrade": 0, "diseases": set()}
+    users[user_id]["iq"] = iq
+
+def get_diseases(user_id):
+    if user_id not in users:
+        users[user_id] = {"iq": 100, "last_degrade": 0, "diseases": set()}
+    return users[user_id]["diseases"]
+
+def get_last_degrade(user_id):
+    if user_id not in users:
+        users[user_id] = {"iq": 100, "last_degrade": 0, "diseases": set()}
+    return users[user_id]["last_degrade"]
+
+def set_last_degrade(user_id, timestamp):
+    if user_id not in users:
+        users[user_id] = {"iq": 100, "last_degrade": 0, "diseases": set()}
+    users[user_id]["last_degrade"] = timestamp
+
+def calculate_multiplier(user_id):
+    mult = 1.0
+    for d in get_diseases(user_id):
+        mult += diseases.get(d, 0)
+    return mult
 
 async def degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != GROUP_ID:
         return
 
     user_id = update.effective_user.id
-    now = datetime.utcnow()
+    now = time.time()
 
-    if user_id not in users:
-        users[user_id] = {"iq": INITIAL_IQ, "last_degrade": None, "diseases": []}
-
-    user = users[user_id]
-
-    # Проверка таймера (1 час)
-    if user["last_degrade"] and now - user["last_degrade"] < timedelta(hours=1):
-        left = timedelta(hours=1) - (now - user["last_degrade"])
-        mins, secs = divmod(left.seconds, 60)
-        await update.message.reply_text(f"⏳ Подожди {mins} мин {secs} сек до следующей деградации.")
+    last = get_last_degrade(user_id)
+    if now - last < DEGRADE_COOLDOWN:
+        left = int(DEGRADE_COOLDOWN - (now - last))
+        m, s = divmod(left, 60)
+        await update.message.reply_text(f"⏳ Ты уже деградировал, подожди {m} мин {s} сек.")
         return
 
-    if not actions:
-        await update.message.reply_text("⚠️ Админ еще не добавил действия для деградации.")
+    if not degrade_actions:
+        await update.message.reply_text("⚠️ Нет доступных действий деградации. Обратитесь к админу.")
         return
 
-    action = random.choice(actions)
+    action = random.choice(degrade_actions)
+    base_iq_loss = abs(action["iq_change"])
+    multiplier = calculate_multiplier(user_id)
+    iq_loss = int(base_iq_loss * multiplier)
 
-    base_drop = action["iq_drop"]
-    # Считаем множитель болезней
-    multiplier = 1.0 + sum(d["multiplier"] for d in diseases if d["name"] in user["diseases"])
+    # Обновляем IQ
+    iq = get_iq(user_id) - iq_loss
+    set_iq(user_id, iq)
+    set_last_degrade(user_id, now)
 
-    drop = int(base_drop * multiplier)
-    user["iq"] -= drop
-    user["last_degrade"] = now
+    emoji = random.choice(EMOJIS)
 
-    text = f"{action['text']}, твой IQ упал на {drop} {random_emoji()}\nСейчас IQ: {user['iq']} {random_emoji()}"
+    msg = f"{action['text']}, твой IQ упал на {iq_loss} {emoji}\nСейчас твой IQ: {iq} {random.choice(EMOJIS)}"
 
-    # Рандомная вероятность подхватить болезнь 10%
-    if diseases and random.random() < 0.1:
-        new_disease = random.choice(diseases)
-        if new_disease["name"] not in user["diseases"]:
-            user["diseases"].append(new_disease["name"])
-            text += f"\n\n🤢 Ты подхватил болезнь: {new_disease['name']}! Теперь твой IQ падает на {int(new_disease['multiplier']*100)}% больше."
+    # Шанс получить болезнь
+    if diseases and random.random() < 0.2:  # 20% шанс заболеть
+        disease_name = random.choice(list(diseases.keys()))
+        if disease_name not in get_diseases(user_id):
+            get_diseases(user_id).add(disease_name)
+            msg += f"\n{random.choice(EMOJIS)} Вы подхватили болезнь: {disease_name}. Теперь IQ падает на {int(diseases[disease_name]*100)}% больше!"
 
-    await update.message.reply_text(text)
+    await update.message.reply_text(msg)
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != GROUP_ID:
         return
 
     if not users:
-        await update.message.reply_text("Пока нет данных по IQ.")
+        await update.message.reply_text("Пока нет данных о пользователях.")
         return
 
-    top_list = sorted(users.items(), key=lambda x: x[1]["iq"], reverse=True)[:10]
-    text = "🏆 Топ по IQ:\n"
-    for i, (uid, data) in enumerate(top_list, 1):
-        text += f"{i}. Пользователь {uid}: IQ {data['iq']} {random_emoji()}\n"
-    await update.message.reply_text(text)
+    sorted_users = sorted(users.items(), key=lambda x: x[1]["iq"], reverse=True)[:10]
+
+    msg = "🏆 Топ IQ:\n"
+    for i, (uid, data) in enumerate(sorted_users, 1):
+        emoji = random.choice(EMOJIS)
+        msg += f"{i}. Пользователь {uid}: IQ {data['iq']} {emoji}\n"
+    await update.message.reply_text(msg)
 
 async def my(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user = users.get(user_id)
-    if not user:
-        await update.message.reply_text("Ты еще не деградировал, IQ 100.")
+    dis = get_diseases(user_id)
+    if not dis:
+        await update.message.reply_text("У вас нет болезней.")
         return
+    msg = "Ваши болезни:\n" + "\n".join(dis)
+    await update.message.reply_text(msg)
 
-    if not user["diseases"]:
-        await update.message.reply_text("У тебя нет болезней.")
-    else:
-        text = "Твои болезни:\n" + "\n".join(user["diseases"])
-        await update.message.reply_text(text)
+# --- Админ команды ---
 
-# Админка: /add <текст> <минус_iq>
 async def add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
         return
 
     args = context.args
     if len(args) < 2:
-        await update.message.reply_text("❌ Формат: /add <текст> <минус_iq>")
+        await update.message.reply_text("❌ Формат: /add текст минус_iq\nПример: /add Купил айфон в кредит -3")
         return
 
     try:
-        iq_drop = int(args[-1])
-    except ValueError:
-        await update.message.reply_text("❌ Последний аргумент должен быть числом (минус IQ).")
+        iq_change = int(args[-1])
+        text = " ".join(args[:-1])
+    except:
+        await update.message.reply_text("❌ Последний аргумент должен быть числом (отрицательным)")
         return
 
-    text = " ".join(args[:-1])
-    actions.append({"text": text, "iq_drop": iq_drop})
-    await update.message.reply_text(f"✅ Добавлено действие: {text} (-{iq_drop} IQ)")
+    degrade_actions.append({"text": text, "iq_change": iq_change})
+    await update.message.reply_text(f"Добавлено действие: '{text}' с изменением IQ {iq_change}")
 
-# Админка: /del <номер>
 async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
         return
-
-    args = context.args
-    if len(args) != 1 or not args[0].isdigit():
-        await update.message.reply_text("❌ Формат: /del <номер>")
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ Формат: /del номер")
         return
+    idx = int(context.args[0]) - 1
+    if 0 <= idx < len(degrade_actions):
+        action = degrade_actions.pop(idx)
+        await update.message.reply_text(f"Удалено действие: '{action['text']}'")
+    else:
+        await update.message.reply_text("❌ Неверный номер")
 
-    idx = int(args[0]) - 1
-    if idx < 0 or idx >= len(actions):
-        await update.message.reply_text("❌ Неверный номер.")
-        return
-
-    removed = actions.pop(idx)
-    await update.message.reply_text(f"✅ Удалено действие: {removed['text']}")
-
-# Показать все действия /list
 async def list_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
         return
-
-    if not actions:
-        await update.message.reply_text("Пока нет добавленных действий.")
+    if not degrade_actions:
+        await update.message.reply_text("Пока нет действий.")
         return
+    msg = "Доступные действия деградации:\n"
+    for i, action in enumerate(degrade_actions, 1):
+        msg += f"{i}. {action['text']} ({action['iq_change']} IQ)\n"
+    await update.message.reply_text(msg)
 
-    text = "Действия:\n"
-    for i, a in enumerate(actions, 1):
-        text += f"{i}. {a['text']} (-{a['iq_drop']} IQ)\n"
+async def adddisease(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Формат: /adddisease название множитель (пример: 0.3)")
+        return
+    name = " ".join(context.args[:-1])
+    try:
+        mult = float(context.args[-1])
+    except:
+        await update.message.reply_text("❌ Множитель должен быть числом, например 0.3")
+        return
+    diseases[name] = mult
+    await update.message.reply_text(f"Добавлена болезнь '{name}' с множителем {mult}")
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        return
+    users.clear()
+    degrade_actions.clear()
+    diseases.clear()
+    await update.message.reply_text("Состояние бота сброшено (IQ, болезни, действия)")
+
+async def eair(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id != ADMIN_ID:
+        return
+    text = (
+        "🛠️ Админские команды:\n"
+        "/add <текст> <минус_iq> — добавить действие деградации\n"
+        "/del <номер> — удалить действие\n"
+        "/list — показать все действия\n"
+        "/adddisease <название> <множитель> — добавить болезнь\n"
+        "/reset — сбросить IQ и болезни у всех\n"
+    )
     await update.message.reply_text(text)
 
-# Добавить болезнь: /adddisease <название> <множитель>
-async def add_disease(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("❌ Формат: /adddisease <название> <множитель>")
-        return
-
-    try:
-        multiplier = float(args[-1])
-    except ValueError:
-        await update.message.reply_text("❌ Множитель должен быть числом (например 0.3 для +30%).")
-        return
-
-    name = " ".join(args[:-1])
-    diseases.append({"name": name, "multiplier": multiplier})
-    await update.message.reply_text(f"✅ Добавлена болезнь: {name} (IQ падает на {int(multiplier*100)}% больше)")
-
-# Сбросить IQ и болезни у всех: /reset
-async def reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-
-    for user in users.values():
-        user["iq"] = INITIAL_IQ
-        user["diseases"] = []
-        user["last_degrade"] = None
-
-    await update.message.reply_text("✅ Все IQ и болезни сброшены.")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Бот для деградации IQ запущен!")
-
-async def unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Неизвестная команда.")
+# --- Основной запуск ---
 
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("degrade", degrade))
     app.add_handler(CommandHandler("top", top))
     app.add_handler(CommandHandler("my", my))
@@ -192,11 +226,11 @@ def main():
     app.add_handler(CommandHandler("add", add))
     app.add_handler(CommandHandler("del", delete))
     app.add_handler(CommandHandler("list", list_actions))
-    app.add_handler(CommandHandler("adddisease", add_disease))
-    app.add_handler(CommandHandler("reset", reset_all))
+    app.add_handler(CommandHandler("adddisease", adddisease))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("eair", eair))
 
-    app.add_handler(MessageHandler(filters.COMMAND, unknown))
-
+    print("Бот запущен...")
     app.run_polling()
 
 if __name__ == "__main__":
