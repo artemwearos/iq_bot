@@ -414,3 +414,28 @@ def main():
 
 if __name__ == "__main__":
     main()
+    from telegram import Update
+from telegram.ext import ContextTypes, CommandHandler
+
+async def eair(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Проверка админа (замени на свою функцию проверки)
+    user_id = update.effective_user.id
+    if user_id != 6878462090:  # твой айди
+        return
+
+    async with lock:
+        if not degrade_actions:
+            await update.message.reply_text("Список действий пуст.")
+            return
+        msg = "Действия деградации:\n"
+        for i, action in enumerate(degrade_actions, 1):
+            iq_ch = action["iq_change"]
+            sign = "+" if iq_ch > 0 else ""
+            msg += f"{i}. {action['text']} ({sign}{iq_ch} IQ)\n"
+
+    try:
+        await context.bot.send_message(chat_id=user_id, text=msg)
+    except:
+        await update.message.reply_text("Не могу отправить личное сообщение. Напишите боту в ЛС первым.")
+
+app.add_handler(CommandHandler("eair", eair))
