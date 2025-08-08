@@ -3,11 +3,9 @@
 Полный рабочий бот "IQ-degrade" с админ-панелью на inline-кнопках.
 Версия рассчитана на python-telegram-bot==20.3
 
-ВАЖНО: токен вставлен прямо в код (как просил). Если позже захотешь, рекомендую вынести в
-переменную окружения BOT_TOKEN для безопасности.
+Токен вставлен прямо в код (как просил).
 """
 
-import os
 import json
 import random
 import asyncio
@@ -28,7 +26,7 @@ from telegram.ext import (
 )
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = "7909644376:AAEJO4qo53-joyp3N6UCvZG9xPp1gj2m13g"  # <- вставлен прямо, как просили
+BOT_TOKEN = "7909644376:AAEJO4qo53-joyp3N6UCvZG9xPp1gj2m13g"  # <- токен в коде
 ALLOWED_GROUP_ID = -1001941069892  # группа где работают /degrade и /top
 ADMIN_IDS = {6878462090}  # твой id (и других админов при необходимости)
 
@@ -37,8 +35,7 @@ AUTOSAVE_INTERVAL = 10  # секунды автосохранения
 DEGRADE_COOLDOWN_SEC = 3600  # 1 час (в секундах)
 DEFAULT_DISEASE_CHANCE = 20  # %
 
-# включить поддержку фото при добавлении действий/болезней
-USE_PHOTO_SUPPORT = True
+USE_PHOTO_SUPPORT = True  # если True — можно добавлять фото к действиям/болезням
 
 EMOJIS = ["🎉", "👽", "🤢", "😵", "💀", "🤡", "🧠", "🔥", "❌", "⚡️", "🤠", "👻"]
 
@@ -70,10 +67,10 @@ def random_emoji() -> str:
 
 # -------------- PERSISTENCE --------------
 DEFAULT_DATA = {
-    "users": {},  # "user_id": {"iq":100,"ultra":0,"points":0,"last_degrade_iso":"","diseases":[]}
-    "degrade_actions": [],  # [{"text": "...", "iq_delta": -3, "photo_file_id": Optional[str]}]
-    "diseases": [],  # [{"name":"...", "multiplier":1.3, "min_hours":24, "max_hours":72, "photo_file_id": Optional[str]}]
-    "user_commands": [],  # [{"user_id":123, "text":"...", "created_iso":"..."}]
+    "users": {},
+    "degrade_actions": [],
+    "diseases": [],
+    "user_commands": [],
     "disease_chance": DEFAULT_DISEASE_CHANCE,
 }
 
@@ -90,7 +87,6 @@ def load_data():
             DATA = DEFAULT_DATA.copy()
     else:
         DATA = DEFAULT_DATA.copy()
-    # ensure keys
     for k, v in DEFAULT_DATA.items():
         if k not in DATA:
             DATA[k] = v
@@ -122,7 +118,7 @@ def ensure_user_record(user_id: int) -> Dict[str, Any]:
             "ultra": 0,
             "points": 0,
             "last_degrade_iso": "",
-            "diseases": [],  # [{"name","start_iso","duration_h","multiplier"}]
+            "diseases": [],
         }
     return users[key]
 
@@ -161,7 +157,7 @@ def compute_disease_multiplier(rec: Dict[str, Any]) -> float:
     total = 0.0
     for d in rec.get("diseases", []):
         total += float(d.get("multiplier", 0)) - 1.0
-    return total  # 0.3 -> +30%
+    return total
 
 
 def format_user_diseases(rec: Dict[str, Any]) -> str:
@@ -257,7 +253,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     key = query.data
 
-    # Add action
     if key == "add_action":
         await qmsg.reply_text("Введите текст действия (пример: Купил айфон в кредит):")
         return S_ADD_ACTION_TEXT
@@ -285,7 +280,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await qmsg.reply_text(text)
         return S_MENU
 
-    # Diseases
     if key == "add_disease":
         await qmsg.reply_text("Введите название болезни:")
         return S_ADD_DISEASE_NAME
@@ -324,7 +318,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await qmsg.reply_text(text)
         return S_MENU
 
-    # manage users
     if key == "manage_users":
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("Установить IQ", callback_data="set_iq")],
@@ -467,7 +460,6 @@ async def receive_del_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-# Add disease sequence
 async def receive_add_disease_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if not name:
@@ -579,7 +571,6 @@ async def receive_del_disease(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
-# SET IQ / ULTRA / POINTS
 async def receive_set_iq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = update.message.text.strip().split()
     if len(parts) != 2:
@@ -782,15 +773,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
-# -------------- Build app and handlers --------------
+# -------------- Build app and handlers (FIXED order) --------------
 def build_app():
     global _app
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     _app = app
 
-    # Global callback handler to catch buttons even if Conversation state lost
-    app.add_handler(CallbackQueryHandler(admin_callback))
-
+    # ConversationHandler (админ-панель) — добавляем первым, чтобы он имел приоритет
     conv = ConversationHandler(
         entry_points=[CommandHandler("eair", cmd_eair)],
         states={
@@ -818,7 +807,11 @@ def build_app():
         allow_reentry=True,
     )
 
+    # add ConversationHandler first (group 0 by default)
     app.add_handler(conv)
+
+    # Global CallbackQueryHandler as fallback — group=1 so it triggers only if Conversation didn't handle it
+    app.add_handler(CallbackQueryHandler(admin_callback), group=1)
 
     # user commands
     app.add_handler(CommandHandler("start", lambda u, c: c.bot.send_message(chat_id=u.effective_chat.id, text="Привет! Пиши /my или используй /degrade в группе.")))
