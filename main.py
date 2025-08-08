@@ -1,8 +1,9 @@
 # main.py
-import asyncio
+import os
 import json
-import logging
 import random
+import asyncio
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
@@ -19,13 +20,14 @@ from telegram.ext import (
 )
 
 # ---------------- CONFIG ----------------
-BOT_TOKEN = "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ"  # <- Поставь свой токен или используй os.environ
-ALLOWED_GROUP_ID = -1001941069892  # <- группа, где работают /degrade и /top
-ADMIN_IDS = {6878462090}  # <- множество админов (твой id)
+# Рекомендуется хранить BOT_TOKEN в env var BOT_TOKEN (на Railway / GitHub Actions и т.д.)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ")
+ALLOWED_GROUP_ID = int(os.environ.get("ALLOWED_GROUP_ID", "-1001941069892"))
+ADMIN_IDS = set(int(x) for x in os.environ.get("ADMIN_IDS", "6878462090").split(","))
 
 DATA_FILE = Path("data.json")
-AUTOSAVE_INTERVAL = 10  # секунды автосохранения
-DEGRADE_COOLDOWN_SEC = 3600  # 1 час
+AUTOSAVE_INTERVAL = 10  # сек
+DEGRADE_COOLDOWN_SEC = 3600  # сек (1 час)
 DEFAULT_DISEASE_CHANCE = 20  # %
 
 EMOJIS = ["🎉", "👽", "🤢", "😵", "💀", "🤡", "🧠", "🔥", "❌", "⚡️"]
@@ -36,10 +38,10 @@ log = logging.getLogger(__name__)
 # -------------- GLOBALS & LOCK --------------
 lock = asyncio.Lock()
 DATA: Dict[str, Any] = {}
-_app = None  # будет Application
+_app = None  # will hold Application instance
 
 
-# -------------- UTILITIES --------------
+# -------------- HELPERS --------------
 def utc_now() -> datetime:
     return datetime.utcnow()
 
@@ -58,10 +60,10 @@ def random_emoji() -> str:
 
 # -------------- PERSISTENCE --------------
 DEFAULT_DATA = {
-    "users": {},  # "user_id": {"iq":100,"ultra":0,"points":0,"last_degrade_iso":"","diseases":[]}
-    "degrade_actions": [],  # [{"text":...,"iq_delta":-3}, ...]
-    "diseases": [],  # [{"name":...,"multiplier":1.3,"min_hours":24,"max_hours":72}, ...]
-    "user_commands": [],  # [{"user_id":id,"text":...}, ...]
+    "users": {},  # str(user_id) -> {iq, ultra, points, last_degrade_iso, diseases: [{name,start_iso,duration_h,multiplier}]}
+    "degrade_actions": [],  # [{text, iq_delta}]
+    "diseases": [],  # [{name, multiplier, min_hours, max_hours}]
+    "user_commands": [],  # [{user_id, text}]
     "disease_chance": DEFAULT_DISEASE_CHANCE,
 }
 
@@ -73,7 +75,7 @@ def load_data():
             with DATA_FILE.open("r", encoding="utf-8") as f:
                 DATA = json.load(f)
         except Exception:
-            log.exception("Failed to load data.json, use default")
+            log.exception("Failed to load data.json — using defaults")
             DATA = DEFAULT_DATA.copy()
     else:
         DATA = DEFAULT_DATA.copy()
@@ -99,7 +101,7 @@ async def autosave_loop():
             save_data()
 
 
-# -------------- HELPERS --------------
+# -------------- User helpers --------------
 def ensure_user_record(user_id: int) -> Dict[str, Any]:
     users = DATA.setdefault("users", {})
     key = str(user_id)
@@ -109,7 +111,7 @@ def ensure_user_record(user_id: int) -> Dict[str, Any]:
             "ultra": 0,
             "points": 0,
             "last_degrade_iso": "",
-            "diseases": [],  # [{"name":..., "start_iso":..., "duration_h":..., "multiplier":...}]
+            "diseases": [],  # [{name, start_iso, duration_h, multiplier}]
         }
     return users[key]
 
@@ -213,32 +215,37 @@ def admin_keyboard():
     return InlineKeyboardMarkup(kb)
 
 
-# -------------- Admin entry --------------
+# -------------- Admin handlers --------------
 async def cmd_eair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.message.reply_text("🚫 Доступ только для админов.")
+        await (update.effective_message or update.message).reply_text("🚫 Доступ только для админов.")
         return ConversationHandler.END
     txt = (
         "🛠 *Админ-панель*\n\n"
         "Кнопки ниже управляют ботом. Нажмите нужную кнопку."
     )
-    await update.message.reply_text(txt, reply_markup=admin_keyboard(), parse_mode="Markdown")
+    await (update.effective_message or update.message).reply_text(txt, reply_markup=admin_keyboard(), parse_mode="Markdown")
     return S_MENU
 
 
-# -------------- Admin menu callbacks --------------
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # This handler is registered both globally and inside ConversationHandler to be robust.
     query = update.callback_query
+    if not query:
+        return ConversationHandler.END
     await query.answer()
     user_id = query.from_user.id
     if user_id not in ADMIN_IDS:
-        await query.message.edit_text("🚫 Доступ только для админов.")
+        try:
+            await query.message.edit_text("🚫 Доступ только для админов.")
+        except Exception:
+            pass
         return ConversationHandler.END
 
     data = query.data
 
-    # Add action flow
+    # ADD ACTION
     if data == "add_action":
         await query.message.reply_text("Введите текст действия (пример: Купил айфон в кредит):")
         return S_ADD_ACTION_TEXT
@@ -265,7 +272,7 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(text)
         return S_MENU
 
-    # Diseases
+    # DISEASES
     if data == "add_disease":
         await query.message.reply_text("Введите название болезни:")
         return S_ADD_DISEASE_NAME
@@ -338,7 +345,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for uid, rec in DATA.get("users", {}).items():
                 rec["last_degrade_iso"] = ""
             save_data()
-        await query.message.edit_text("✅ Таймеры у всех сброшены.")
+        try:
+            await query.message.edit_text("✅ Таймеры у всех сброшены.")
+        except Exception:
+            pass
         return ConversationHandler.END
 
     if data == "reset_diseases":
@@ -362,7 +372,10 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return S_SET_CHANCE
 
     if data == "close":
-        await query.message.edit_text("Закрыто.")
+        try:
+            await query.message.edit_text("Закрыто.")
+        except Exception:
+            pass
         return ConversationHandler.END
 
     if data == "back":
@@ -373,109 +386,109 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return S_MENU
 
 
-# -------------- ADMIN: receivers (Conversation) --------------
+# -------------- Admin Conversation receivers --------------
 async def receive_add_action_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
+    text = (update.effective_message or update.message).text.strip()
     if not text:
-        await update.message.reply_text("Текст не должен быть пустым. Введите снова:")
+        await (update.effective_message or update.message).reply_text("Текст не должен быть пустым. Введите снова:")
         return S_ADD_ACTION_TEXT
     context.user_data["new_action_text"] = text
-    await update.message.reply_text("Теперь введите IQ delta (например -3 или 2). Отрицательное — уменьшает IQ.")
+    await (update.effective_message or update.message).reply_text("Теперь введите IQ delta (например -3 или 2). Отрицательное — уменьшает IQ.")
     return S_ADD_ACTION_IQ
 
 
 async def receive_add_action_iq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = update.message.text.strip()
+    s = (update.effective_message or update.message).text.strip()
     try:
         iq = int(s)
     except ValueError:
-        await update.message.reply_text("IQ должен быть целым числом. Попробуйте снова:")
+        await (update.effective_message or update.message).reply_text("IQ должен быть целым числом. Попробуйте снова:")
         return S_ADD_ACTION_IQ
     text = context.user_data.pop("new_action_text", None)
     if not text:
-        await update.message.reply_text("Ошибка — начните заново.")
+        await (update.effective_message or update.message).reply_text("Ошибка — начните заново.")
         return ConversationHandler.END
     async with lock:
         DATA.setdefault("degrade_actions", []).append({"text": text, "iq_delta": iq})
         save_data()
-    await update.message.reply_text(f"✅ Добавлено действие: {text} ({iq} IQ)")
+    await (update.effective_message or update.message).reply_text(f"✅ Добавлено действие: {text} ({iq} IQ)")
     return ConversationHandler.END
 
 
 async def receive_del_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = update.message.text.strip()
+    s = (update.effective_message or update.message).text.strip()
     try:
         idx = int(s) - 1
     except ValueError:
-        await update.message.reply_text("Нужен номер (целое число).")
+        await (update.effective_message or update.message).reply_text("Нужен номер (целое число).")
         return S_DEL_ACTION
     async with lock:
         arr = DATA.get("degrade_actions", [])
         if not (0 <= idx < len(arr)):
-            await update.message.reply_text("Неверный номер.")
+            await (update.effective_message or update.message).reply_text("Неверный номер.")
             return ConversationHandler.END
         removed = arr.pop(idx)
         save_data()
-    await update.message.reply_text(f"✅ Удалено: {removed['text']}")
+    await (update.effective_message or update.message).reply_text(f"✅ Удалено: {removed['text']}")
     return ConversationHandler.END
 
 
 async def receive_add_disease_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
+    name = (update.effective_message or update.message).text.strip()
     if not name:
-        await update.message.reply_text("Название не должно быть пустым.")
+        await (update.effective_message or update.message).reply_text("Название не должно быть пустым.")
         return S_ADD_DISEASE_NAME
     context.user_data["disease_name"] = name
-    await update.message.reply_text("Введи минимальное время (часы, целое):")
+    await (update.effective_message or update.message).reply_text("Введи минимальное время (часы, целое):")
     return S_ADD_DISEASE_MIN
 
 
 async def receive_add_disease_min(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = update.message.text.strip()
+    s = (update.effective_message or update.message).text.strip()
     try:
         v = int(s)
         if v <= 0:
             raise ValueError()
     except ValueError:
-        await update.message.reply_text("Нужен положительный целый час.")
+        await (update.effective_message or update.message).reply_text("Нужен положительный целый час.")
         return S_ADD_DISEASE_MIN
     context.user_data["disease_min"] = v
-    await update.message.reply_text("Введи максимальное время (часы, целое, >= минимального):")
+    await (update.effective_message or update.message).reply_text("Введи максимальное время (часы, целое, >= минимального):")
     return S_ADD_DISEASE_MAX
 
 
 async def receive_add_disease_max(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = update.message.text.strip()
+    s = (update.effective_message or update.message).text.strip()
     try:
         v = int(s)
         if v <= 0:
             raise ValueError()
     except ValueError:
-        await update.message.reply_text("Нужен положительный целый час.")
+        await (update.effective_message or update.message).reply_text("Нужен положительный целый час.")
         return S_ADD_DISEASE_MAX
     if v < context.user_data.get("disease_min", 0):
-        await update.message.reply_text("Максимум не может быть меньше минимума.")
+        await (update.effective_message or update.message).reply_text("Максимум не может быть меньше минимума.")
         return S_ADD_DISEASE_MAX
     context.user_data["disease_max"] = v
-    await update.message.reply_text("Введи множитель (float), например 1.3 (1.0 = без эффекта):")
+    await (update.effective_message or update.message).reply_text("Введи множитель (float), например 1.3 (1.0 = без эффекта):")
     return S_ADD_DISEASE_MULT
 
 
 async def receive_add_disease_mult(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = update.message.text.strip().replace(",", ".")
+    s = (update.effective_message or update.message).text.strip().replace(",", ".")
     try:
         mult = float(s)
     except ValueError:
-        await update.message.reply_text("Неверный формат множителя. Пример: 1.3")
+        await (update.effective_message or update.message).reply_text("Неверный формат множителя. Пример: 1.3")
         return S_ADD_DISEASE_MULT
     if mult < 1.0:
-        await update.message.reply_text("Множитель должен быть >= 1.0")
+        await (update.effective_message or update.message).reply_text("Множитель должен быть >= 1.0")
         return S_ADD_DISEASE_MULT
     name = context.user_data.pop("disease_name", None)
     hmin = context.user_data.pop("disease_min", None)
     hmax = context.user_data.pop("disease_max", None)
     if not name:
-        await update.message.reply_text("Ошибка данных. Начните заново.")
+        await (update.effective_message or update.message).reply_text("Ошибка данных. Начните заново.")
         return ConversationHandler.END
     async with lock:
         DATA.setdefault("diseases", []).append({
@@ -485,100 +498,100 @@ async def receive_add_disease_mult(update: Update, context: ContextTypes.DEFAULT
             "max_hours": int(hmax),
         })
         save_data()
-    await update.message.reply_text(f"✅ Болезнь '{name}' добавлена: {hmin}-{hmax} ч, x{mult}")
+    await (update.effective_message or update.message).reply_text(f"✅ Болезнь '{name}' добавлена: {hmin}-{hmax} ч, x{mult}")
     return ConversationHandler.END
 
 
 async def receive_del_disease(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = update.message.text.strip()
+    s = (update.effective_message or update.message).text.strip()
     try:
         idx = int(s) - 1
     except ValueError:
-        await update.message.reply_text("Нужен номер (целое число).")
+        await (update.effective_message or update.message).reply_text("Нужен номер (целое число).")
         return S_DEL_DISEASE
     async with lock:
         arr = DATA.get("diseases", [])
         if not (0 <= idx < len(arr)):
-            await update.message.reply_text("Неверный номер.")
+            await (update.effective_message or update.message).reply_text("Неверный номер.")
             return ConversationHandler.END
         removed = arr.pop(idx)
         save_data()
-    await update.message.reply_text(f"✅ Удалена болезнь: {removed['name']}")
+    await (update.effective_message or update.message).reply_text(f"✅ Удалена болезнь: {removed['name']}")
     return ConversationHandler.END
 
 
 async def receive_set_iq(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = update.message.text.strip().split()
-    if len(parts) != 2:
-        await update.message.reply_text("Формат: <user_id> <iq>")
+    s = (update.effective_message or update.message).text.strip().split()
+    if len(s) != 2:
+        await (update.effective_message or update.message).reply_text("Формат: <user_id> <iq>")
         return S_SET_IQ
     try:
-        uid = int(parts[0]); iq = int(parts[1])
+        uid = int(s[0]); iq = int(s[1])
     except ValueError:
-        await update.message.reply_text("ID и IQ должны быть целыми числами.")
+        await (update.effective_message or update.message).reply_text("ID и IQ должны быть целыми числами.")
         return S_SET_IQ
     async with lock:
         rec = ensure_user_record(uid)
         rec["iq"] = iq
         save_data()
-    await update.message.reply_text(f"✅ IQ пользователя {uid} установлен в {iq}")
+    await (update.effective_message or update.message).reply_text(f"✅ IQ пользователя {uid} установлен в {iq}")
     return ConversationHandler.END
 
 
 async def receive_set_ultra(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = update.message.text.strip().split()
-    if len(parts) != 2:
-        await update.message.reply_text("Формат: <user_id> <ultra>")
+    s = (update.effective_message or update.message).text.strip().split()
+    if len(s) != 2:
+        await (update.effective_message or update.message).reply_text("Формат: <user_id> <ultra>")
         return S_SET_ULTRA
     try:
-        uid = int(parts[0]); ultra = int(parts[1])
+        uid = int(s[0]); ultra = int(s[1])
     except ValueError:
-        await update.message.reply_text("ID и ultra должны быть целыми.")
+        await (update.effective_message or update.message).reply_text("ID и ultra должны быть целыми.")
         return S_SET_ULTRA
     async with lock:
         rec = ensure_user_record(uid)
         rec["ultra"] = ultra
         save_data()
-    await update.message.reply_text(f"✅ Ultra пользователя {uid} установлен в {ultra}")
+    await (update.effective_message or update.message).reply_text(f"✅ Ultra пользователя {uid} установлен в {ultra}")
     return ConversationHandler.END
 
 
 async def receive_set_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parts = update.message.text.strip().split()
-    if len(parts) != 2:
-        await update.message.reply_text("Формат: <user_id> <points>")
+    s = (update.effective_message or update.message).text.strip().split()
+    if len(s) != 2:
+        await (update.effective_message or update.message).reply_text("Формат: <user_id> <points>")
         return S_SET_POINTS
     try:
-        uid = int(parts[0]); pts = int(parts[1])
+        uid = int(s[0]); pts = int(s[1])
     except ValueError:
-        await update.message.reply_text("ID и points должны быть целыми.")
+        await (update.effective_message or update.message).reply_text("ID и points должны быть целыми.")
         return S_SET_POINTS
     async with lock:
         rec = ensure_user_record(uid)
         rec["points"] = rec.get("points", 0) + pts
         save_data()
-    await update.message.reply_text(f"✅ Пользователю {uid} выданы {pts} points (теперь {rec.get('points')}).")
+    await (update.effective_message or update.message).reply_text(f"✅ Пользователю {uid} выданы {pts} points (теперь {rec.get('points')}).")
     return ConversationHandler.END
 
 
 async def receive_set_chance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    s = update.message.text.strip()
+    s = (update.effective_message or update.message).text.strip()
     try:
         v = int(s)
     except ValueError:
-        await update.message.reply_text("Введите целое 0-100.")
+        await (update.effective_message or update.message).reply_text("Введите целое 0-100.")
         return S_SET_CHANCE
     if not (0 <= v <= 100):
-        await update.message.reply_text("Значение должно быть 0-100.")
+        await (update.effective_message or update.message).reply_text("Значение должно быть 0-100.")
         return S_SET_CHANCE
     async with lock:
         DATA["disease_chance"] = v
         save_data()
-    await update.message.reply_text(f"✅ Шанс заболевания установлен: {v}%")
+    await (update.effective_message or update.message).reply_text(f"✅ Шанс заболевания установлен: {v}%")
     return ConversationHandler.END
 
 
-# -------------- USER COMMANDS --------------
+# -------------- User commands --------------
 async def cmd_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat is None or chat.id != ALLOWED_GROUP_ID:
@@ -594,7 +607,6 @@ async def cmd_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mm = rem // 60; ss = rem % 60
             await update.message.reply_text(f"⏳ Подожди {mm} мин {ss} сек до следующей деградации.")
             return
-        # actions: admin actions + user commands
         actions = list(DATA.get("degrade_actions", []))
         for uc in DATA.get("user_commands", []):
             actions.append({"text": uc["text"], "iq_delta": -1})
@@ -693,18 +705,27 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(txt)
 
 
-# -------------- fallback --------------
-async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отмена.")
-    return ConversationHandler.END
+# -------------- Error handler --------------
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Exception while handling an update:", exc_info=context.error)
+    # optionally notify admin(s)
+    for admin in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin, text=f"Ошибка в боте: {context.error}")
+        except Exception:
+            pass
 
 
-# -------------- app builder --------------
+# -------------- Build app --------------
 def build_app():
     global _app
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     _app = app
 
+    # Global callback query handler (catches button presses even if Conversation state lost)
+    app.add_handler(CallbackQueryHandler(admin_callback))
+
+    # Conversation handler for admin flows
     conv = ConversationHandler(
         entry_points=[CommandHandler("eair", cmd_eair)],
         states={
@@ -723,26 +744,25 @@ def build_app():
             S_SET_CHANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_set_chance)],
             S_CONFIRM_RESET_TIMERS: [CallbackQueryHandler(admin_callback)],
         },
-        fallbacks=[CommandHandler("cancel", admin_cancel)],
+        fallbacks=[CommandHandler("cancel", lambda u, c: c.bot.send_message(chat_id=u.effective_chat.id, text="Отмена."))],
         allow_reentry=True,
     )
 
     app.add_handler(conv)
 
     # user commands
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("Привет! Пиши /my или используй /degrade в группе.")))
+    app.add_handler(CommandHandler("start", lambda u, c: c.bot.send_message(chat_id=u.effective_chat.id, text="Привет! Пиши /my или используй /degrade в группе.")))
     app.add_handler(CommandHandler("degrade", cmd_degrade))
     app.add_handler(CommandHandler("top", cmd_top))
     app.add_handler(CommandHandler("my", cmd_my))
     app.add_handler(CommandHandler("d", cmd_d_add))
     app.add_handler(CommandHandler("list", cmd_list))
-    app.add_handler(CommandHandler("help", lambda u, c: c.bot.send_message(chat_id=u.effective_chat.id, text=(
-        "/degrade /top /my /d\nАдмин: /eair"))))
+    app.add_error_handler(error_handler)
 
     return app
 
 
-# -------------- main --------------
+# -------------- Main --------------
 def main():
     load_data()
     app = build_app()
