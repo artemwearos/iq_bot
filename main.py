@@ -209,9 +209,7 @@ async def add_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Добавлено действие: {text} с IQ {iq_loss}")
     except:
         await update.message.reply_text("Ошибка в аргументах.")
-
-async def del_degrade(update: Update, context: ContextTypes
-                      async def del_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def del_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("🚫 Ты не админ.")
@@ -226,8 +224,8 @@ async def del_degrade(update: Update, context: ContextTypes
             await update.message.reply_text(f"Удалено действие: {removed['text']}")
         else:
             await update.message.reply_text("Неверный номер действия.")
-    except:
-        await update.message.reply_text("Ошибка при удалении действия.")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка при удалении действия: {e}")
 
 async def add_disease(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
