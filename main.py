@@ -1,197 +1,168 @@
 import logging
 import random
-import asyncio
+import time
 from datetime import datetime, timedelta
-from telegram import Update, Chat, ChatMember
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, filters
 
-# Настройки
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
+
+# Токен и настройки
 BOT_TOKEN = "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ"
-ALLOWED_GROUP_ID = -1001941069892  # твоя группа
 ADMIN_ID = 6878462090
+ALLOWED_GROUP_ID = -1001941069892
 
-# Логи
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Данные бота (память)
-users_iq = {}  # user_id: iq (int)
-users_last_degrade = {}  # user_id: datetime
-users_diseases = {}  # user_id: list of dicts {name, start, duration_hrs, effect_percent}
-degrade_actions = []  # list of dicts {text:str, iq_delta:int}
-degrade_custom_cmds = []  # list of dicts {user_id:int, text:str}
-disease_list = []  # list of dicts {name:str, effect_percent:int, min_dur:int, max_dur:int}
+# Данные пользователей, болезней и действий (в памяти)
+users_iq = {}  # user_id: int IQ
+users_last_degrade = {}  # user_id: timestamp последней деградации
+users_points = {}  # user_id: int очков для добавления кастомных команд
+users_diseases = {}  # user_id: list of dict {name, effect, expire_time}
 
-users_points = {}  # user_id: int (очки для пользовательских команд)
+degrade_actions = []  # список действий с текстом и минусом IQ
+diseases = []  # список болезней с названием, эффектом (%) и диапазоном времени в часах
+degrade_custom_cmds = []  # пользовательские команды, добавленные за очки
 
-# Смайлы для рандома
-EMOJIS = ['🎉', '👽', '🤢', '😵', '💀', '🤡', '🧟', '🤖', '🔥', '🧠', '👻', '😈']
+SMILES = ["🎉", "👽", "🤢", "🔥", "💀", "👾", "😵", "🧠", "🛑", "😈"]
 
-def get_random_emoji():
-    return random.choice(EMOJIS)
+DEGRADE_COOLDOWN = 3600  # 1 час в секундах
 
-def current_time():
-    return datetime.utcnow()
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
-def format_time_diff(dt: datetime):
-    now = current_time()
-    diff = dt - now
-    if diff.total_seconds() <= 0:
-        return "0 секунд"
-    hours, remainder = divmod(int(diff.total_seconds()), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    parts = []
-    if hours > 0:
-        parts.append(f"{hours} ч")
-    if minutes > 0:
-        parts.append(f"{minutes} мин")
-    if seconds > 0:
-        parts.append(f"{seconds} с")
-    return " ".join(parts)
-
-def get_user_nick(update: Update, user_id: int):
-    # Пытаемся получить никнейм пользователя из чата, если нет - id
+def check_group(update: Update) -> bool:
     chat = update.effective_chat
-    try:
-        member = chat.get_member(user_id)
-        if member.user.username:
-            return f"@{member.user.username}"
-        else:
-            name = member.user.first_name or "User"
-            return f"{name}"
-    except Exception:
-        return str(user_id)
-
-def calc_disease_effect(user_id):
-    # Суммируем эффект всех активных болезней у пользователя
-    if user_id not in users_diseases:
-        return 0
-    now = current_time()
-    total_percent = 0
-    for d in users_diseases[user_id]:
-        end_time = d['start'] + timedelta(hours=d['duration_hrs'])
-        if end_time > now:
-            total_percent += d['effect_percent']
-    return total_percent
-
-def clean_expired_diseases():
-    now = current_time()
-    for uid in list(users_diseases.keys()):
-        new_list = []
-        for d in users_diseases[uid]:
-            end_time = d['start'] + timedelta(hours=d['duration_hrs'])
-            if end_time > now:
-                new_list.append(d)
-        users_diseases[uid] = new_list
-        if not users_diseases[uid]:
-            del users_diseases[uid]
-
-async def ensure_user_initialized(user_id):
-    if user_id not in users_iq:
-        users_iq[user_id] = 100
-    if user_id not in users_last_degrade:
-        users_last_degrade[user_id] = datetime.fromtimestamp(0)
-    if user_id not in users_points:
-        users_points[user_id] = 0
-
-def check_group(update: Update):
-    return update.effective_chat and update.effective_chat.id == ALLOWED_GROUP_ID
-
-# ========== Команды ==========
+    if chat and chat.id == ALLOWED_GROUP_ID:
+        return True
+    return False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.chat.type != "private":
-        await update.message.reply_text("Пиши мне в личку для управления и информации.")
-        return
-    await update.message.reply_text("Привет! Я бот для деградации IQ. В группе используйте /degrade.")
+    await update.message.reply_text("Привет! Это бот для деградации IQ. Используй /degrade в группе.")
+
+async def ensure_user_initialized(user_id: int):
+    if user_id not in users_iq:
+        users_iq[user_id] = 100
+    if user_id not in users_points:
+        users_points[user_id] = 0
+    if user_id not in users_last_degrade:
+        users_last_degrade[user_id] = 0
+    if user_id not in users_diseases:
+        users_diseases[user_id] = []
+
+def get_random_smile():
+    return random.choice(SMILES)
+
+def get_effective_iq_loss(base_loss, user_id):
+    # Считаем суммарный эффект болезней
+    total_percent = 0
+    now = datetime.now()
+    new_diseases = []
+    for disease in users_diseases.get(user_id, []):
+        if disease["expire_time"] > now:
+            total_percent += disease["effect"]
+            new_diseases.append(disease)
+    users_diseases[user_id] = new_diseases
+    final_loss = int(base_loss * (1 + total_percent / 100))
+    return final_loss
 
 async def degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_group(update):
         return
     user_id = update.effective_user.id
     await ensure_user_initialized(user_id)
+    now_ts = time.time()
 
-    now = current_time()
-    last = users_last_degrade[user_id]
-    diff = (now - last).total_seconds()
-    if diff < 3600:
-        remain = format_time_diff(last + timedelta(hours=1))
-        await update.message.reply_text(f"⏳ Подожди ещё {remain} до следующей деградации.")
+    last = users_last_degrade.get(user_id, 0)
+    if now_ts - last < DEGRADE_COOLDOWN:
+        remain = int((DEGRADE_COOLDOWN - (now_ts - last)) / 60)
+        await update.message.reply_text(f"⏳ Можно деградировать раз в час. Жди {remain} мин.")
         return
 
     if not degrade_actions:
-        await update.message.reply_text("Пока нет действий для деградации.")
+        await update.message.reply_text("Пока нет настроенных действий деградации.")
         return
 
-    # Выбираем случайное действие с равной вероятностью
     action = random.choice(degrade_actions)
-    base_iq_delta = action['iq_delta']
+    base_iq_loss = action["iq_loss"]
+    iq_loss = get_effective_iq_loss(base_iq_loss, user_id)
 
-    # Считаем эффект болезней
-    effect_percent = calc_disease_effect(user_id)
-    total_iq_delta = int(base_iq_delta * (1 + effect_percent / 100))
+    users_iq[user_id] = users_iq.get(user_id, 100) - iq_loss
+    users_last_degrade[user_id] = now_ts
 
-    users_iq[user_id] += total_iq_delta
-    users_last_degrade[user_id] = now
-
-    emoji = get_random_emoji()
-    msg = (f"{action['text']}, твой IQ изменился на {total_iq_delta} {emoji}\n"
-           f"Сейчас твой IQ: {users_iq[user_id]}")
-
-    # Рандомно шанс заболеть
-    if disease_list:
+    # Шанс подхватить болезнь
+    if diseases:
         chance = random.randint(1, 100)
-        if chance <= 10:  # 10% шанс заболеть
-            disease = random.choice(disease_list)
-            duration = random.randint(disease['min_dur'], disease['max_dur'])
-            new_disease = {
-                "name": disease['name'],
-                "start": now,
-                "duration_hrs": duration,
-                "effect_percent": disease['effect_percent']
-            }
-            users_diseases.setdefault(user_id, []).append(new_disease)
-            msg += f"\n{get_random_emoji()} Вы подхватили болезнь: {disease['name']}. " \
-                   f"Теперь IQ падает на {disease['effect_percent']}% больше {get_random_emoji()}"
+        # Например, 20% шанс
+        if chance <= 20:
+            disease = random.choice(diseases)
+            # Срок болезни от min до max часов
+            now = datetime.now()
+            hours = random.randint(disease["min_hours"], disease["max_hours"])
+            expire = now + timedelta(hours=hours)
+            users_diseases[user_id].append({
+                "name": disease["name"],
+                "effect": disease["effect"],
+                "expire_time": expire,
+            })
+            disease_text = f"\n{get_random_smile()} Вы подхватили болезнь: {disease['name']}! IQ будет падать на {disease['effect']}% больше."
+        else:
+            disease_text = ""
+    else:
+        disease_text = ""
+
+    smile = get_random_smile()
+
+    msg = (
+        f"{action['text']}, твой IQ упал на {iq_loss} {smile}\n"
+        f"Сейчас твой IQ: {users_iq[user_id]}{disease_text}"
+    )
     await update.message.reply_text(msg)
 
 async def my_diseases(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in users_diseases or not users_diseases[user_id]:
+    await ensure_user_initialized(user_id)
+
+    now = datetime.now()
+    diseases_list = users_diseases.get(user_id, [])
+    if not diseases_list:
         await update.message.reply_text("У тебя нет болезней.")
         return
-    now = current_time()
-    msgs = []
-    for d in users_diseases[user_id]:
-        end_time = d['start'] + timedelta(hours=d['duration_hrs'])
-        if end_time > now:
-            remain = format_time_diff(end_time)
-            msgs.append(f"{d['name']} - осталось: {remain}")
+
+    msg = "Твои болезни:\n"
+    for i, d in enumerate(diseases_list, 1):
+        if d["expire_time"] > now:
+            left = d["expire_time"] - now
+            hours = left.total_seconds() // 3600
+            minutes = (left.total_seconds() % 3600) // 60
+            msg += f"{i}. {d['name']} — действует еще {int(hours)}ч {int(minutes)}м\n"
         else:
-            msgs.append(f"{d['name']} - истекла {end_time.strftime('%Y-%m-%d %H:%M:%S')} (МСК)")
-    await update.message.reply_text("\n".join(msgs))
+            msg += f"{i}. {d['name']} — болезнь истекла {d['expire_time'].strftime('%Y-%m-%d %H:%M:%S')} по МСК\n"
+    await update.message.reply_text(msg)
 
 async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_group(update):
         return
-    if not users_iq:
-        await update.message.reply_text("Пока нет данных по IQ.")
-        return
-    sorted_users = sorted(users_iq.items(), key=lambda x: x[1])
-    msg = "Топ IQ (от самого низкого):\n"
-    for i, (uid, iq) in enumerate(sorted_users[:10], 1):
-        nick = get_user_nick(update, uid)
-        emoji = get_random_emoji()
-        msg += f"{i}. {nick} — {iq} {emoji}\n"
+
+    sorted_users = sorted(users_iq.items(), key=lambda x: x[1], reverse=True)
+    msg = "Топ по IQ:\n"
+    for i, (user_id, iq) in enumerate(sorted_users[:10], 1):
+        try:
+            user = await context.bot.get_chat(user_id)
+            name = user.first_name or str(user_id)
+        except:
+            name = str(user_id)
+        msg += f"{i}. {name}: {iq}\n"
     await update.message.reply_text(msg)
 
-# --- Админские команды ---
-
-def is_admin(user_id):
-    return user_id == ADMIN_ID
+# --- Админ команды ---
 
 async def eair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -199,43 +170,27 @@ async def eair(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 Ты не админ.")
         return
 
-    msg = "=== Админка ===\n\n"
-
+    msg = "=== Админ панель ===\n\n"
     msg += "Действия деградации:\n"
     if degrade_actions:
-        for i, act in enumerate(degrade_actions, 1):
-            msg += f"{i}. {act['text']} (IQ {act['iq_delta']})\n"
+        for i, a in enumerate(degrade_actions, 1):
+            msg += f"{i}. {a['text']} | IQ: {a['iq_loss']}\n"
     else:
         msg += "Пока нет действий.\n"
 
     msg += "\nБолезни:\n"
-    if disease_list:
-        for i, d in enumerate(disease_list, 1):
-            msg += (f"{i}. {d['name']} — эффект {d['effect_percent']}%, "
-                    f"длительность {d['min_dur']}–{d['max_dur']} ч\n")
+    if diseases:
+        for i, d in enumerate(diseases, 1):
+            msg += f"{i}. {d['name']} | Эффект: {d['effect']}% | Время: {d['min_hours']}–{d['max_hours']} ч\n"
     else:
         msg += "Пока нет болезней.\n"
 
     msg += "\nПользовательские команды деградации:\n"
     if degrade_custom_cmds:
-        for i, cmd in enumerate(degrade_custom_cmds, 1):
-            msg += f"{i}. ({cmd['user_id']}) {cmd['text']}\n"
+        for i, c in enumerate(degrade_custom_cmds, 1):
+            msg += f"{i}. ({c['user_id']}) {c['text']}\n"
     else:
         msg += "Нет пользовательских команд.\n"
-
-    msg += "\nТекущие пользователи IQ:\n"
-    if users_iq:
-        for uid, iq in users_iq.items():
-            msg += f"{uid}: {iq}\n"
-    else:
-        msg += "Пока нет пользователей.\n"
-
-    msg += "\nОчки пользователей:\n"
-    if users_points:
-        for uid, pts in users_points.items():
-            msg += f"{uid}: {pts}\n"
-    else:
-        msg += "Нет очков.\n"
 
     await update.message.reply_text(msg)
 
@@ -244,235 +199,213 @@ async def add_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user_id):
         await update.message.reply_text("🚫 Ты не админ.")
         return
-    args = context.args
-    if len(args) < 2:
+    if len(context.args) < 2:
         await update.message.reply_text("Используй: /add <текст действия> <число IQ>")
         return
     try:
-        iq_delta = int(args[-1])
-        text = " ".join(args[:-1])
+        iq_loss = int(context.args[-1])
+        text = " ".join(context.args[:-1])
+        degrade_actions.append({"text": text, "iq_loss": iq_loss})
+        await update.message.reply_text(f"Добавлено действие: {text} с IQ {iq_loss}")
     except:
-        await update.message.reply_text("Ошибка в формате IQ. Должно быть число.")
-        return
-    degrade_actions.append({"text": text, "iq_delta": iq_delta})
-    await update.message.reply_text(f"Добавлено действие: {text} (IQ {iq_delta})")
+        await update.message.reply_text("Ошибка в аргументах.")
 
-async def del_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def del_degrade(update: Update, context: ContextTypes
+                      async def del_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("🚫 Ты не админ.")
         return
-    args = context.args
-    if len(args) != 1:
-        await update.message.reply_text("Используй: /del <номер>")
+    if len(context.args) != 1:
+        await update.message.reply_text("Используй: /del <номер действия>")
         return
     try:
-        idx = int(args[0]) - 1
-        if idx < 0 or idx >= len(degrade_actions):
-            await update.message.reply_text("Неверный номер.")
-            return
-        deleted = degrade_actions.pop(idx)
-        await update.message.reply_text(f"Удалено действие: {deleted['text']}")
+        idx = int(context.args[0]) - 1
+        if 0 <= idx < len(degrade_actions):
+            removed = degrade_actions.pop(idx)
+            await update.message.reply_text(f"Удалено действие: {removed['text']}")
+        else:
+            await update.message.reply_text("Неверный номер действия.")
     except:
-        await update.message.reply_text("Ошибка в номере.")
+        await update.message.reply_text("Ошибка при удалении действия.")
 
 async def add_disease(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("🚫 Ты не админ.")
         return
-    args = context.args
-    if len(args) < 4:
-        await update.message.reply_text("Используй: /adddisease <название> <эффект%> <мин часы> <макс часы>")
+    if len(context.args) < 4:
+        await update.message.reply_text(
+            "Используй: /adddisease <название> <эффект%> <мин.часы> <макс.часы>"
+        )
         return
     try:
-        name = args[0]
-        effect = int(args[1])
-        minh = int(args[2])
-        maxh = int(args[3])
-        if minh > maxh:
-            await update.message.reply_text("Мин. часы не могут быть больше макс. часов.")
-            return
+        name = context.args[0]
+        effect = int(context.args[1])
+        min_hours = int(context.args[2])
+        max_hours = int(context.args[3])
+        diseases.append({
+            "name": name,
+            "effect": effect,
+            "min_hours": min_hours,
+            "max_hours": max_hours,
+        })
+        await update.message.reply_text(f"Добавлена болезнь: {name}")
     except:
         await update.message.reply_text("Ошибка в аргументах.")
-        return
-    disease_list.append({
-        "name": name,
-        "effect_percent": effect,
-        "min_dur": minh,
-        "max_dur": maxh
-    })
-    await update.message.reply_text(f"Добавлена болезнь {name} с эффектом {effect}%, длительность {minh}-{maxh} ч")
 
 async def del_disease(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("🚫 Ты не админ.")
         return
-    args = context.args
-    if len(args) != 1:
+    if len(context.args) != 1:
         await update.message.reply_text("Используй: /deldisease <номер>")
         return
     try:
-        idx = int(args[0]) - 1
-        if idx < 0 or idx >= len(disease_list):
-            await update.message.reply_text("Неверный номер.")
-            return
-        deleted = disease_list.pop(idx)
-        await update.message.reply_text(f"Удалена болезнь {deleted['name']}")
+        idx = int(context.args[0]) - 1
+        if 0 <= idx < len(diseases):
+            removed = diseases.pop(idx)
+            await update.message.reply_text(f"Удалена болезнь: {removed['name']}")
+        else:
+            await update.message.reply_text("Неверный номер болезни.")
     except:
-        await update.message.reply_text("Ошибка в номере.")
+        await update.message.reply_text("Ошибка при удалении болезни.")
 
-async def set_iq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_diseases(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("🚫 Ты не админ.")
         return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Используй: /setiq <user_id> <iq>")
+    if not diseases:
+        await update.message.reply_text("Пока нет болезней.")
         return
-    try:
-        uid = int(args[0])
-        iq = int(args[1])
-        users_iq[uid] = iq
-        await update.message.reply_text(f"Установлен IQ {iq} для пользователя {uid}")
-    except:
-        await update.message.reply_text("Ошибка в аргументах.")
-
-async def reset_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("🚫 Ты не админ.")
-        return
-    users_iq.clear()
-    users_last_degrade.clear()
-    users_diseases.clear()
-    degrade_actions.clear()
-    degrade_custom_cmds.clear()
-    disease_list.clear()
-    users_points.clear()
-    await update.message.reply_text("Все данные сброшены!")
+    msg = "Список болезней:\n"
+    for i, d in enumerate(diseases, 1):
+        msg += f"{i}. {d['name']} | Эффект: {d['effect']}% | Время: {d['min_hours']}–{d['max_hours']} ч\n"
+    await update.message.reply_text(msg)
 
 async def reset_diseases(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("🚫 Ты не админ.")
         return
-    users_diseases.clear()
-    await update.message.reply_text("Все болезни у всех пользователей сброшены!")
+    for uid in users_diseases.keys():
+        users_diseases[uid] = []
+    await update.message.reply_text("Все болезни сброшены у всех пользователей.")
 
-async def add_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if
-    async def add_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reset_iq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
         await update.message.reply_text("🚫 Ты не админ.")
         return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Используй: /addpoints <user_id> <очки>")
+    for uid in users_iq.keys():
+        users_iq[uid] = 100
+    await update.message.reply_text("IQ всех пользователей сброшен до 100.")
+
+async def set_iq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 Ты не админ.")
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("Используй: /setiq <user_id> <значение>")
         return
     try:
-        uid = int(args[0])
-        pts = int(args[1])
-        users_points[uid] = users_points.get(uid, 0) + pts
-        await update.message.reply_text(f"Добавлено {pts} очков пользователю {uid}. Текущие очки: {users_points[uid]}")
+        target_id = int(context.args[0])
+        iq_val = int(context.args[1])
+        users_iq[target_id] = iq_val
+        await update.message.reply_text(f"У пользователя {target_id} установлен IQ = {iq_val}")
     except:
         await update.message.reply_text("Ошибка в аргументах.")
 
-async def user_add_degrade_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_point(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await ensure_user_initialized(user_id)
-
-    # Проверка баланса очков
-    if users_points.get(user_id, 0) < 1:
-        await update.message.reply_text("У тебя недостаточно очков для добавления команды деградации (нужно 1 очко).")
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 Ты не админ.")
         return
+    if len(context.args) != 2:
+        await update.message.reply_text("Используй: /addpoint <user_id> <кол-во>")
+        return
+    try:
+        target_id = int(context.args[0])
+        pts = int(context.args[1])
+        users_points[target_id] = users_points.get(target_id, 0) + pts
+        await update.message.reply_text(f"Пользователю {target_id} добавлено {pts} очков.")
+    except:
+        await update.message.reply_text("Ошибка в аргументах.")
 
+async def my_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    pts = users_points.get(user_id, 0)
+    await update.message.reply_text(f"У тебя {pts} очков.")
+
+async def add_custom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    pts = users_points.get(user_id, 0)
+    if pts < 1:
+        await update.message.reply_text("У тебя нет очков для добавления команды (нужно 1).")
+        return
+    if not context.args:
+        await update.message.reply_text("Используй: /d <текст действия>")
+        return
     text = " ".join(context.args)
-    if not text:
-        await update.message.reply_text("Используй: /d <текст команды>")
-        return
-
     degrade_custom_cmds.append({
         "user_id": user_id,
-        "text": text
+        "text": text,
+        "iq_loss": 1,
     })
+    users_points[user_id] = pts - 1
+    await update.message.reply_text("Пользовательская команда добавлена.")
 
-    # Снимаем 1 очко
-    users_points[user_id] -= 1
-    await update.message.reply_text(f"Команда добавлена. У тебя осталось {users_points[user_id]} очков.")
-
-    # Уведомление админу
-    try:
-        await context.bot.send_message(ADMIN_ID, f"Пользователь {user_id} добавил команду деградации:\n{text}")
-    except Exception as e:
-        logger.error(f"Не удалось отправить уведомление админу: {e}")
-
-async def list_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not check_group(update):
+async def list_custom_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 Ты не админ.")
         return
-
-    msg = "Доступные команды:\n"
-    msg += "/degrade — выполнить деградацию IQ (раз в час)\n"
-    msg += "/my — посмотреть свои болезни и их статус\n"
-    msg += "/top — топ пользователей по IQ\n"
-    if update.effective_user.id == ADMIN_ID:
-        msg += "\nАдмин команды:\n"
-        msg += "/eair — показать админ панель\n"
-        msg += "/add <текст действия> <IQ> — добавить действие деградации\n"
-        msg += "/del <номер> — удалить действие деградации\n"
-        msg += "/adddisease <название> <эффект%> <мин часы> <макс часы> — добавить болезнь\n"
-        msg += "/deldisease <номер> — удалить болезнь\n"
-        msg += "/setiq <user_id> <iq> — установить IQ пользователю\n"
-        msg += "/addpoints <user_id> <очки> — добавить очки пользователю\n"
-        msg += "/reset — сбросить все данные\n"
-        msg += "/resetdiseases — сбросить все болезни\n"
-    msg += "\nПользовательские команды деградации:\n"
-    if degrade_custom_cmds:
-        for i, cmd in enumerate(degrade_custom_cmds, 1):
-            msg += f"{i}. ({cmd['user_id']}) {cmd['text']}\n"
-    else:
-        msg += "Пока нет пользовательских команд.\n"
+    if not degrade_custom_cmds:
+        await update.message.reply_text("Пользовательских команд нет.")
+        return
+    msg = "Пользовательские команды деградации:\n"
+    for i, c in enumerate(degrade_custom_cmds, 1):
+        msg += f"{i}. ({c['user_id']}) {c['text']} IQ: {c['iq_loss']}\n"
     await update.message.reply_text(msg)
 
-# Обработка пользовательской кастомной команды деградации (рандомно срабатывает в degrade)
-def get_random_custom_degrade():
-    if degrade_custom_cmds:
-        return random.choice(degrade_custom_cmds)['text']
-    return None
-
-async def degrade_with_custom(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Для замены команды /degrade - можно не использовать, т.к. основной degrade уже есть.
-    # Но можно добавить вывод кастомной команды с IQ эффектом 0 или -1 для эффекта.
-    pass
-
-# Регистрация обработчиков
+async def reset_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("🚫 Ты не админ.")
+        return
+    for uid in users_last_degrade.keys():
+        users_last_degrade[uid] = 0
+    await update.message.reply_text("Таймеры деградации у всех сброшены.")
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("degrade", degrade))
-    app.add_handler(CommandHandler("my", my_diseases))
-    app.add_handler(CommandHandler("top", top))
+    # Пользовательские команды
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("degrade", degrade))
+    application.add_handler(CommandHandler("mydiseases", my_diseases))
+    application.add_handler(CommandHandler("top", top))
+    application.add_handler(CommandHandler("d", add_custom_command))
+    application.add_handler(CommandHandler("mypoints", my_points))
 
-    app.add_handler(CommandHandler("eair", eair))
-    app.add_handler(CommandHandler("add", add_degrade))
-    app.add_handler(CommandHandler("del", del_degrade))
-    app.add_handler(CommandHandler("adddisease", add_disease))
-    app.add_handler(CommandHandler("deldisease", del_disease))
-    app.add_handler(CommandHandler("setiq", set_iq))
-    app.add_handler(CommandHandler("reset", reset_all))
-    app.add_handler(CommandHandler("resetdiseases", reset_diseases))
-    app.add_handler(CommandHandler("addpoints", add_points))
-    app.add_handler(CommandHandler("d", user_add_degrade_cmd))
-    app.add_handler(CommandHandler("list", list_commands))
+    # Админ команды
+    application.add_handler(CommandHandler("eair", eair))
+    application.add_handler(CommandHandler("add", add_degrade))
+    application.add_handler(CommandHandler("del", del_degrade))
+    application.add_handler(CommandHandler("adddisease", add_disease))
+    application.add_handler(CommandHandler("deldisease", del_disease))
+    application.add_handler(CommandHandler("listdiseases", list_diseases))
+    application.add_handler(CommandHandler("resetdiseases", reset_diseases))
+    application.add_handler(CommandHandler("resetiq", reset_iq))
+    application.add_handler(CommandHandler("setiq", set_iq))
+    application.add_handler(CommandHandler("addpoint", add_point))
+    application.add_handler(CommandHandler("listcustom", list_custom_commands))
+    application.add_handler(CommandHandler("resettimer", reset_timer))
 
-    print("Bot started...")
-    app.run_polling()
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
