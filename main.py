@@ -1,10 +1,10 @@
 # main.py
 """
-Полный самодостаточный бот "IQ-degrade" с админкой через inline-кнопки.
-- Версия: поддержка python-telegram-bot==20.3
-- Настройки через env vars: BOT_TOKEN, ADMIN_IDS (comma), ALLOWED_GROUP_ID
-- Данные сохраняются в data.json
-- Флаг USE_PHOTO_SUPPORT включит этап загрузки фото для действий/болезней
+Полный рабочий бот "IQ-degrade" с админ-панелью на inline-кнопках.
+Версия рассчитана на python-telegram-bot==20.3
+
+ВАЖНО: токен вставлен прямо в код (как просил). Если позже захотешь, рекомендую вынести в
+переменную окружения BOT_TOKEN для безопасности.
 """
 
 import os
@@ -14,7 +14,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -28,19 +28,16 @@ from telegram.ext import (
 )
 
 # ---------------- CONFIG ----------------
-# Рекомендуется: задать BOT_TOKEN в переменной окружения BOT_TOKEN на Railway/Heroku
-BOT_TOKEN = os.environ.get("7909644376:AAEJO4qo53-joyp3N6UCvZG9xPp1gj2m13g", "REPLACE_WITH_YOUR_TOKEN")
-# Админы: список id через запятую или в коде по умолчанию
-ADMIN_IDS = set(int(x) for x in os.environ.get("ADMIN_IDS", "6878462090").split(",") if x.strip())
-# ID группы, где работают /degrade и /top (можно менять)
-ALLOWED_GROUP_ID = int(os.environ.get("ALLOWED_GROUP_ID", "-1001941069892"))
+BOT_TOKEN = "7909644376:AAEJO4qo53-joyp3N6UCvZG9xPp1gj2m13g"  # <- вставлен прямо, как просили
+ALLOWED_GROUP_ID = -1001941069892  # группа где работают /degrade и /top
+ADMIN_IDS = {6878462090}  # твой id (и других админов при необходимости)
 
 DATA_FILE = Path("data.json")
-AUTOSAVE_INTERVAL = 10  # seconds
-DEGRADE_COOLDOWN_SEC = int(os.environ.get("DEGRADE_COOLDOWN_SEC", 3600))  # seconds
-DEFAULT_DISEASE_CHANCE = int(os.environ.get("DEFAULT_DISEASE_CHANCE", 20))
+AUTOSAVE_INTERVAL = 10  # секунды автосохранения
+DEGRADE_COOLDOWN_SEC = 3600  # 1 час (в секундах)
+DEFAULT_DISEASE_CHANCE = 20  # %
 
-# Включить поддержку фото (если True, бот при добавлении действия/болезни будет ожидать фото)
+# включить поддержку фото при добавлении действий/болезней
 USE_PHOTO_SUPPORT = True
 
 EMOJIS = ["🎉", "👽", "🤢", "😵", "💀", "🤡", "🧠", "🔥", "❌", "⚡️", "🤠", "👻"]
@@ -51,10 +48,10 @@ log = logging.getLogger(__name__)
 # -------------- GLOBALS & LOCK --------------
 lock = asyncio.Lock()
 DATA: Dict[str, Any] = {}
-_app = None  # Application instance set in build_app()
+_app = None  # будет установлен приложением
 
 
-# -------------- Utilities --------------
+# -------------- UTILITIES --------------
 def utc_now() -> datetime:
     return datetime.utcnow()
 
@@ -71,9 +68,9 @@ def random_emoji() -> str:
     return random.choice(EMOJIS)
 
 
-# -------------- Persistence --------------
+# -------------- PERSISTENCE --------------
 DEFAULT_DATA = {
-    "users": {},  # "user_id": {"iq":100,"ultra":0,"points":0,"last_degrade_iso":"","diseases":[{name,start_iso,duration_h,multiplier}]}
+    "users": {},  # "user_id": {"iq":100,"ultra":0,"points":0,"last_degrade_iso":"","diseases":[]}
     "degrade_actions": [],  # [{"text": "...", "iq_delta": -3, "photo_file_id": Optional[str]}]
     "diseases": [],  # [{"name":"...", "multiplier":1.3, "min_hours":24, "max_hours":72, "photo_file_id": Optional[str]}]
     "user_commands": [],  # [{"user_id":123, "text":"...", "created_iso":"..."}]
@@ -115,7 +112,7 @@ async def autosave_loop():
             save_data()
 
 
-# -------------- User helpers --------------
+# -------------- HELPERS --------------
 def ensure_user_record(user_id: int) -> Dict[str, Any]:
     users = DATA.setdefault("users", {})
     key = str(user_id)
@@ -125,7 +122,7 @@ def ensure_user_record(user_id: int) -> Dict[str, Any]:
             "ultra": 0,
             "points": 0,
             "last_degrade_iso": "",
-            "diseases": [],  # each: {"name","start_iso","duration_h","multiplier"}
+            "diseases": [],  # [{"name","start_iso","duration_h","multiplier"}]
         }
     return users[key]
 
@@ -160,12 +157,11 @@ def clean_expired_user_diseases(rec: Dict[str, Any]):
 
 
 def compute_disease_multiplier(rec: Dict[str, Any]) -> float:
-    # sum of (multiplier -1)
     clean_expired_user_diseases(rec)
     total = 0.0
     for d in rec.get("diseases", []):
         total += float(d.get("multiplier", 0)) - 1.0
-    return total  # e.g. 0.3 -> +30%
+    return total  # 0.3 -> +30%
 
 
 def format_user_diseases(rec: Dict[str, Any]) -> str:
@@ -234,28 +230,23 @@ def admin_keyboard():
 
 # -------------- Admin entry --------------
 async def cmd_eair(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # admin only
     user_id = update.effective_user.id
     if user_id not in ADMIN_IDS:
-        await update.effective_message.reply_text("🚫 Доступ только для админов.")
+        await (update.effective_message or update.message).reply_text("🚫 Доступ только для админов.")
         return ConversationHandler.END
     txt = ("🛠 *Админ-панель*\n\n"
            "Кнопки ниже управляют ботом. Нажмите нужную кнопку.")
-    await update.effective_message.reply_text(txt, reply_markup=admin_keyboard(), parse_mode="Markdown")
+    await (update.effective_message or update.message).reply_text(txt, reply_markup=admin_keyboard(), parse_mode="Markdown")
     return S_MENU
 
 
 # -------------- Admin callback handler --------------
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This callback handles inline buttons from admin keyboard
     query = update.callback_query
-    if query:
-        await query.answer()
-        qmsg = query.message
-    else:
-        # safety
+    if not query:
         return ConversationHandler.END
-
+    await query.answer()
+    qmsg = query.message
     user_id = query.from_user.id
     if user_id not in ADMIN_IDS:
         try:
@@ -411,7 +402,6 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------- Admin conversation receivers --------------
-# ADD ACTION text
 async def receive_add_action_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if not text:
@@ -427,7 +417,6 @@ async def receive_add_action_text(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def receive_add_action_photo_wait(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # handle photo or skip
     msg = update.message
     if msg.photo:
         file_id = msg.photo[-1].file_id
@@ -460,7 +449,6 @@ async def receive_add_action_iq(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
-# DEL ACTION
 async def receive_del_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = update.message.text.strip()
     try:
@@ -479,7 +467,7 @@ async def receive_del_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
-# ADD DISEASE sequence
+# Add disease sequence
 async def receive_add_disease_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip()
     if not name:
@@ -560,13 +548,12 @@ async def receive_add_disease_photo_wait(update: Update, context: ContextTypes.D
         file_id = None
     else:
         await update.message.reply_text("Пришлите фото или напишите 'пропустить'.")
-        context.user_data["new_disease_partial"] = part  # keep
+        context.user_data["new_disease_partial"] = part
         return S_ADD_DISEASE_PHOTO_WAIT
     async with lock:
         DATA.setdefault("diseases", []).append({
             "name": part["name"], "multiplier": part["multiplier"],
-            "min_hours": int(part["min_hours"]) if "min_hours" in part else int(part["min_hours"]),
-            "max_hours": int(part["max_hours"]) if "max_hours" in part else int(part["max_hours"]),
+            "min_hours": int(part["min_hours"]), "max_hours": int(part["max_hours"]),
             "photo_file_id": file_id
         })
         save_data()
@@ -574,7 +561,6 @@ async def receive_add_disease_photo_wait(update: Update, context: ContextTypes.D
     return ConversationHandler.END
 
 
-# DEL DISEASE
 async def receive_del_disease(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = update.message.text.strip()
     try:
@@ -681,10 +667,8 @@ async def cmd_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mm = rem // 60; ss = rem % 60
             await update.message.reply_text(f"⏳ Подожди {mm} мин {ss} сек до следующей деградации.")
             return
-        # actions: admin actions + user commands
         actions = list(DATA.get("degrade_actions", []))
         for uc in DATA.get("user_commands", []):
-            # user-defined commands cost -1 IQ by default
             actions.append({"text": uc["text"], "iq_delta": -1, "photo_file_id": None})
         if not actions:
             await update.message.reply_text("⚠️ Админ пока не добавил действий деградации.")
@@ -695,7 +679,6 @@ async def cmd_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         iq_loss = int(base * (1 + mult))
         rec["iq"] = rec.get("iq", 100) - iq_loss
         set_last_degrade(rec, now)
-        # chance to catch disease
         disease_msg = ""
         chance = DATA.get("disease_chance", DEFAULT_DISEASE_CHANCE)
         if DATA.get("diseases") and random.randint(1, 100) <= chance:
@@ -709,15 +692,12 @@ async def cmd_degrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
             disease_msg = f"\n{random_emoji()} Вы подхватили болезнь: {d['name']} (дл. {dur} ч, +{int((d['multiplier']-1)*100)}%)."
         save_data()
-    # build message; include photo if action has photo and allowed
     if USE_PHOTO_SUPPORT and action.get("photo_file_id"):
-        # send photo with caption
         try:
             await context.bot.send_photo(chat_id=update.effective_chat.id, photo=action["photo_file_id"],
                                          caption=f"{action['text']}\nТвой IQ упал на {iq_loss} {random_emoji()}\nСейчас IQ: {rec['iq']}{disease_msg}")
             return
         except Exception:
-            # fallback to text
             pass
     await update.message.reply_text(f"{action['text']}\nТвой IQ упал на {iq_loss} {random_emoji()}\nСейчас IQ: {rec['iq']}{disease_msg}")
 
@@ -738,7 +718,6 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
         arr.sort(key=lambda x: x[1], reverse=True)
     text = "🏆 Топ по IQ:\n"
     for i, (uid, iq) in enumerate(arr[:10], 1):
-        # try to fetch username
         try:
             chat_user = await _app.bot.get_chat(uid)
             name = chat_user.username or chat_user.first_name or str(uid)
@@ -764,7 +743,6 @@ async def cmd_my(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_d_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /d <text> - user adds a user-command costing 1 ultra
     uid = update.effective_user.id
     text = " ".join(context.args).strip()
     if not text:
@@ -797,7 +775,6 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------- Error handler --------------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Exception while handling an update:", exc_info=context.error)
-    # Optionally notify admins
     for admin in ADMIN_IDS:
         try:
             await context.bot.send_message(chat_id=admin, text=f"Ошибка в боте: {context.error}")
@@ -805,7 +782,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
             pass
 
 
-# -------------- Build app and register handlers --------------
+# -------------- Build app and handlers --------------
 def build_app():
     global _app
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -860,7 +837,6 @@ def build_app():
 def main():
     load_data()
     app = build_app()
-    # autosave task
     loop = asyncio.get_event_loop()
     loop.create_task(autosave_loop())
     log.info("Bot starting...")
@@ -869,3 +845,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+```0
