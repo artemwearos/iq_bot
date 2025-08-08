@@ -21,7 +21,7 @@ from telegram.ext import (
 
 # ---------------- CONFIG ----------------
 # Рекомендуется хранить BOT_TOKEN в env var BOT_TOKEN (на Railway / GitHub Actions и т.д.)
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "7909644376:AAHD8zFEV-hjsVSfZ4AdtceBi5u9-ywRHOQ")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "7909644376:AAEJO4qo53-joyp3N6UCvZG9xPp1gj2m13g")
 ALLOWED_GROUP_ID = int(os.environ.get("ALLOWED_GROUP_ID", "-1001941069892"))
 ADMIN_IDS = set(int(x) for x in os.environ.get("ADMIN_IDS", "6878462090").split(","))
 
